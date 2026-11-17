@@ -39,7 +39,7 @@
 <h2 id="about">About</h2>
 
 <p>
-minipg is PostgreSQL as one binary, with nothing to install or configure.
+minipg is PostgreSQL as one executable, ready to use, with no server to configure.
 A <tt>.pgdb</tt> directory is the database:
 its data, config, credentials, and Postgres version all live inside it,
 and <tt>minipg app.pgdb</tt> opens a psql shell on it.
@@ -55,18 +55,6 @@ There's no Linux kernel to boot, no VM image, and no Docker.
 </p>
 
 <h2 id="demo">Demo</h2>
-
-<p>
-Below is minipg in your browser:
-a shell with <tt>minipg</tt> on its path,
-running Postgres 18 for 386 Linux on h9's browser host,
-which is h9 built for wasm32-wasi with <a href="https://github.com/copy/v86">v86</a>, in a Web Worker.
-Try <tt>minipg app.pgdb</tt> for psql,
-<tt>minipg app.pgdb "select version()"</tt>,
-<tt>minipg status app.pgdb</tt>, or
-<tt>minipg dump app.pgdb</tt>.
-The first command starts the server, which takes about 15 seconds here.
-</p>
 
 <p>
 The demo downloads about 35 MB.
