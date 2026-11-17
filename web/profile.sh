@@ -6,11 +6,10 @@ minipg: PostgreSQL as a single executable. This is minipg with Postgres 18 for 3
 Linux, running in your browser under h9.
 
 Try:
-  minipg app.pgdb                       psql (creates app.pgdb)
-  minipg app.pgdb "select version()"    one statement
-  minipg url app.pgdb                   a URL for apps
-  minipg dump app.pgdb                  pg_dump
-  minipg status app.pgdb
-  minipg                                every command
+  minipg app.pgdb # setup db, start shell
+  minipg app.pgdb "create table notes (id serial primary key, body text)"
+  minipg app.pgdb "insert into notes (body) values ('hello')"
+  minipg app.pgdb "select * from notes"
+  minipg          # see all commands
 
 MSG
