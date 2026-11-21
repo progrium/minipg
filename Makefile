@@ -12,6 +12,12 @@ OUT				?= $(NAME)$(call exe,$(OS))
 PG_MAJOR		?= 18
 DIST_DIR		?= dist
 DIST_TARGETS	?= linux_amd64 linux_arm64 macos_arm64 windows_amd64
+# macOS signing. Empty SIGN_IDENTITY signs ad hoc, which Gatekeeper blocks
+# for browser downloads. A "Developer ID Application: ..." identity signs
+# for distribution, and NOTARY_PROFILE (a keychain profile saved with
+# `xcrun notarytool store-credentials`) has `make dist` notarize the zip.
+SIGN_IDENTITY	?=
+NOTARY_PROFILE	?=
 
 ZIG_ARCH_amd64	:= x86_64
 ZIG_ARCH_arm64	:= aarch64
@@ -26,7 +32,7 @@ zig_target		= $(ZIG_ARCH_$(2))-$(zig_os_$(1))
 ## Windows is amd64 only)
 build: assets/root-$(ARCH).tar.xz
 	zig build -Doptimize=$(OPTIMIZE) -Dtarget=$(call zig_target,$(OS),$(ARCH)) -Dversion=$(VERSION) \
-		-p .zig-out/$(OS)_$(ARCH)
+		$(if $(SIGN_IDENTITY),-Dsign-identity="$(SIGN_IDENTITY)") -p .zig-out/$(OS)_$(ARCH)
 	cp .zig-out/$(OS)_$(ARCH)/bin/$(NAME)$(call exe,$(OS)) $(OUT)
 .PHONY: build
 
@@ -77,6 +83,16 @@ $(DIST_DIR)/$(NAME)_$(VERSION)_%.zip:
 	rm -f $@
 	zip -j $@ $(DIST_DIR)/$*/$(NAME)$(call exe,$(word 1,$(subst _, ,$*)))
 	rm -rf $(DIST_DIR)/$*
+ifneq ($(NOTARY_PROFILE),)
+	@if [ "$(word 1,$(subst _, ,$*))" = macos ]; then \
+		test -n "$(SIGN_IDENTITY)" || { echo "NOTARY_PROFILE needs SIGN_IDENTITY (a Developer ID identity)" >&2; exit 1; }; \
+		echo "notarizing $@"; \
+		xcrun notarytool submit $@ --keychain-profile "$(NOTARY_PROFILE)" --wait > $@.notary.log 2>&1; \
+		cat $@.notary.log; \
+		grep -q 'status: Accepted' $@.notary.log || { echo "notarization failed; see xcrun notarytool log" >&2; exit 1; }; \
+		rm -f $@.notary.log; \
+	fi
+endif
 
 .DEFAULT_GOAL := show-help
 

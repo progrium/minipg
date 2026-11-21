@@ -32,6 +32,7 @@ pub fn build(b: *std.Build) void {
     const os = target.result.os.tag;
 
     const version = b.option([]const u8, "version", "Version -v prints (default: dev)") orelse "dev";
+    const sign_identity = b.option([]const u8, "sign-identity", "macOS codesign identity, such as \"Developer ID Application: ...\" (default: -, ad hoc)") orelse "-";
     const host = b.option(Host, "host", "What runs Postgres: h9 machines (default), or linux, ordinary processes inside the Postgres image") orelse .h9;
     const arch: []const u8 = switch (target.result.cpu.arch) {
         .x86_64 => "amd64",
@@ -90,7 +91,11 @@ pub fn build(b: *std.Build) void {
     // HVF refuses to create a VM without the hypervisor entitlement.
     var ready = &install.step;
     if (os == .macos and host == .h9 and b.graph.host.result.os.tag == .macos) {
-        const sign = b.addSystemCommand(&.{ "codesign", "--force", "--sign", "-", "--entitlements" });
+        // Ad hoc ("-") by default. A Developer ID identity also gets the
+        // hardened runtime and a secure timestamp, which notarization needs.
+        const sign = b.addSystemCommand(&.{ "codesign", "--force", "--sign", sign_identity });
+        if (!std.mem.eql(u8, sign_identity, "-")) sign.addArgs(&.{ "--options", "runtime", "--timestamp" });
+        sign.addArg("--entitlements");
         sign.addFileArg(b.path("h9.entitlements"));
         sign.addArg(b.getInstallPath(.bin, exe.out_filename));
         sign.step.dependOn(&install.step);

@@ -55,7 +55,7 @@ Linux builds are static musl binaries, so the same binary runs on glibc distros,
 
 **On Windows,** turn on the Windows Hypervisor Platform in Settings > System > Optional features > More Windows features, or run `DISM /Online /Enable-Feature /FeatureName:HypervisorPlatform` as an administrator, then restart. Without it, minipg says the hypervisor is unavailable. Run minipg from PowerShell, Windows Terminal, or `cmd`; the examples in this manual use POSIX shell syntax, and translate directly.
 
-On macOS, a binary downloaded with a browser may be quarantined by Gatekeeper. If macOS refuses to run it, clear the quarantine attribute with `xattr -d com.apple.quarantine ./minipg`.
+On macOS, a binary downloaded with a browser may be quarantined by Gatekeeper. If macOS refuses to run it, clear the quarantine attribute with `xattr -d com.apple.quarantine ./minipg`. Downloading with `curl -LO` instead of a browser doesn't set that attribute.
 
 Check the install with:
 
