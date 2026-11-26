@@ -467,9 +467,16 @@ pub fn restore(ctx: Ctx, args: cli.Args) !u8 {
             ctx.getenv("TEMP") orelse ctx.getenv("TMP") orelse return ctx.fail("TEMP isn't set", .{})
         else
             ctx.getenv("TMPDIR") orelse "/tmp";
-        const t = try std.fs.path.join(ctx.arena, &.{ tmp_root, try std.fmt.allocPrint(ctx.arena, "minipg-restore-{x}", .{&rnd}) });
-        try paths.makePrivateDir(ctx.io, ctx.arena, t);
-        tmp_dir = t;
+        const made = try std.fs.path.join(ctx.arena, &.{ tmp_root, try std.fmt.allocPrint(ctx.arena, "minipg-restore-{x}", .{&rnd}) });
+        try paths.makePrivateDir(ctx.io, ctx.arena, made);
+        tmp_dir = made;
+        // The machine binds this directory, and h9 needs its real path:
+        // macOS's TMPDIR is under /var, a symlink to /private/var, and
+        // Windows' TEMP can differ in case (C:\Windows\TEMP for Temp) or
+        // use 8.3 short names (C:\Users\RUNNER~1). A dump file given by
+        // path is resolved the same way.
+        const t = std.Io.Dir.cwd().realPathFileAlloc(ctx.io, made, ctx.arena) catch |err|
+            return ctx.fail("{s}: {t}", .{ made, err });
         const f = try std.fs.path.join(ctx.arena, &.{ t, "dump" });
         var out = try std.Io.Dir.cwd().createFile(ctx.io, f, .{});
         defer out.close(ctx.io);
