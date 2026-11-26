@@ -21,7 +21,9 @@ pub const usage =
     \\  status <pgdb>                          whether a server is running, and its details
     \\  url <pgdb> [-d DB]                     a postgres:// URL for apps
     \\  env <pgdb> [-d DB]                     PG* and DATABASE_URL as shell exports
-    \\  run <pgdb> [-d DB] -- CMD [args]       run a host command with DATABASE_URL and PG* set
+    \\  run <pgdb> [-d DB] [--stop] -- CMD [args]
+    \\                                         run a host command with DATABASE_URL and PG* set;
+    \\                                         --stop stops the server it started when CMD exits
     \\  logs <pgdb> [-f]                       the server's recent log
     \\  exec <pgdb> [-d DB] -- TOOL [args]     run a Postgres tool (pg_dump, psql, ...) against it
     \\  dump <pgdb> [-d DB] [pg_dump args]     pg_dump to stdout
@@ -178,6 +180,11 @@ test parse {
     try std.testing.expectEqualStrings("other", r.flag(&.{ "d", "db" }).?);
     try std.testing.expectEqual(@as(usize, 2), r.rest.len);
     try std.testing.expectEqualStrings("-s", r.rest[1]);
+
+    r = try parse(a, &.{ "run", "--stop", "app.pgdb", "--", "miniflux" });
+    try std.testing.expect(r.has(&.{"stop"}));
+    try std.testing.expectEqualStrings("app.pgdb", r.pgdb().?);
+    try std.testing.expectEqualStrings("miniflux", r.rest[0]);
 
     r = try parse(a, &.{ "logs", "app.pgdb", "-f" });
     try std.testing.expect(r.has(&.{ "f", "follow" }));
