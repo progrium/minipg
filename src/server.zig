@@ -168,8 +168,11 @@ pub fn serve(ctx: Ctx, p: Pgdb, opts: Options) !u8 {
     }
 
     // The control socket, then run.json, which points at it.
-    const sock_path = try control.socketPath(arena, runtime);
+    const sock_path = control.socketPath(arena, runtime, key) catch |err|
+        return ctx.fail("control socket for {s}: {t}", .{ runtime, err });
     std.Io.Dir.cwd().deleteFile(io, sock_path) catch {};
+    // std allows 108 bytes on every POSIX host, but macOS's sun_path holds 104.
+    if (sock_path.len > paths.socket_path_max) return ctx.fail("control socket path too long: {s}", .{sock_path});
     const ua = std.Io.net.UnixAddress.init(sock_path) catch return ctx.fail("control socket path too long: {s}", .{sock_path});
     var listener = ua.listen(io, .{}) catch |err| return ctx.fail("control socket {s}: {t}", .{ sock_path, err });
     defer {
