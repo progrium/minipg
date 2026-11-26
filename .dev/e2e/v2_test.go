@@ -47,16 +47,13 @@ func TestEnvAndRun(t *testing.T) {
 		t.Errorf("env: %q", out)
 	}
 	url := e.url("app.pgdb")
+	// The command runs in the caller's directory. sh spells it its own way
+	// (/c/... from Git Bash, /private/var/... on macOS), so compare the
+	// directory itself.
 	got := e.must("run", "app.pgdb", "--", "sh", "-c", `echo "$DATABASE_URL|$PGDATABASE|$PWD"`)
-	// The shell's $PWD is the real path: on macOS the temp dir is under
-	// /var, a symlink to /private/var.
-	dir, err := filepath.EvalSymlinks(e.dir)
-	if err != nil {
-		t.Fatal(err)
-	}
-	want := url + "|app|" + dir
-	if strings.TrimSpace(got) != want {
-		t.Errorf("run: %q, want %q", got, want)
+	f := strings.SplitN(strings.TrimSpace(got), "|", 3)
+	if len(f) != 3 || f[0] != url || f[1] != "app" || !sameDir(f[2], e.dir) {
+		t.Errorf("run: %q, want %q", got, url+"|app|"+e.dir)
 	}
 	if _, _, code := e.run("run", "app.pgdb", "--", "sh", "-c", "exit 7"); code != 7 {
 		t.Errorf("run's exit code: %d, want 7", code)
