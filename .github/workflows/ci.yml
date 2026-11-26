@@ -63,3 +63,30 @@ jobs:
           path: assets
       - name: Unit tests
         run: zig build test
+
+  # End to end on real Windows: the self-hosted h9-whp machine has the
+  # Windows Hypervisor Platform that GitHub's runners lack. It tests the
+  # minipg.exe the Linux job cross-compiled, the binary a release ships.
+  # Self-hosted, so it runs only for branches of this repository, never a
+  # fork's pull request.
+  windows-amd64-e2e:
+    needs: linux-amd64
+    if: github.event_name == 'push' || github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: [self-hosted, h9-whp]
+    timeout-minutes: 30
+    defaults:
+      run:
+        # Git Bash: TestEnvAndRun runs sh on the host.
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.24"
+          cache-dependency-path: .dev/e2e/go.sum
+      - uses: actions/download-artifact@v4
+        with:
+          name: minipg-windows-amd64
+      - name: End-to-end tests
+        working-directory: .dev/e2e
+        run: MINIPG="$GITHUB_WORKSPACE/minipg.exe" go test -count=1 -v ./...
