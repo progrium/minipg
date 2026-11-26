@@ -3,10 +3,14 @@
 //
 //	make build && (cd .dev/e2e && go test -v)
 //
-// MINIPG names the binary (default ../../minipg). Every test gets its own
-// HOME and runtime directory; the unpacked root is shared through
-// MINIPG_E2E_CACHE (default $TMPDIR/minipg-e2e-cache), so only the first
-// test pays for unpacking it.
+// MINIPG names the binary (default ../../minipg, or ../../minipg.exe on
+// Windows). Every test gets its own HOME (and LOCALAPPDATA on Windows), so
+// its own logs and, except on macOS, its own runtime directory; the
+// unpacked root is shared through MINIPG_E2E_CACHE (default
+// $TMPDIR/minipg-e2e-cache), so only the first test pays for unpacking it.
+//
+// The suite runs on Linux, macOS and Windows. On Windows, run it from a
+// shell with sh on PATH (Git Bash), since TestEnvAndRun runs host commands.
 package e2e
 
 import (
@@ -18,9 +22,9 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
-	"syscall"
 	"testing"
 	"time"
 
@@ -33,6 +37,9 @@ func TestMain(m *testing.M) {
 	bin = os.Getenv("MINIPG")
 	if bin == "" {
 		bin = "../../minipg"
+		if runtime.GOOS == "windows" {
+			bin += ".exe"
+		}
 	}
 	abs, err := filepath.Abs(bin)
 	if err != nil {
@@ -63,7 +70,8 @@ func newEnv(t *testing.T) *env {
 	}
 	home := filepath.Join(dir, "home")
 	run := filepath.Join(dir, "run")
-	for _, d := range []string{home, run, cache} {
+	local := filepath.Join(dir, "local")
+	for _, d := range []string{home, run, local, cache} {
 		if err := os.MkdirAll(d, 0o700); err != nil {
 			t.Fatal(err)
 		}
@@ -71,8 +79,8 @@ func newEnv(t *testing.T) *env {
 	e := &env{t: t, dir: dir}
 	for _, kv := range os.Environ() {
 		k, _, _ := strings.Cut(kv, "=")
-		switch k {
-		case "HOME", "XDG_CACHE_HOME", "XDG_RUNTIME_DIR", "XDG_STATE_HOME", "MINIPG_IDLE":
+		switch strings.ToUpper(k) {
+		case "HOME", "LOCALAPPDATA", "XDG_CACHE_HOME", "XDG_RUNTIME_DIR", "XDG_STATE_HOME", "MINIPG_IDLE":
 			continue
 		}
 		if strings.HasPrefix(k, "POSTGRES_") || strings.HasPrefix(k, "PG") {
@@ -80,9 +88,67 @@ func newEnv(t *testing.T) *env {
 		}
 		e.vars = append(e.vars, kv)
 	}
-	e.vars = append(e.vars, "HOME="+home, "XDG_CACHE_HOME="+cache, "XDG_RUNTIME_DIR="+run)
+	e.vars = append(e.vars, "HOME="+home, "LOCALAPPDATA="+local, "XDG_CACHE_HOME="+cache, "XDG_RUNTIME_DIR="+run)
+	// Only Linux reads XDG_CACHE_HOME, so elsewhere the shared root cache
+	// is linked in where minipg looks for it (see paths.zig).
+	switch runtime.GOOS {
+	case "darwin":
+		e.shareRoots(filepath.Join(home, "Library", "Caches", "minipg", "roots"), cache)
+	case "windows":
+		e.shareRoots(filepath.Join(local, "minipg", "roots"), cache)
+	}
 	t.Cleanup(e.stopAll)
 	return e
+}
+
+// shareRoots links minipg's root cache at link to the shared one. If it
+// can't, the test unpacks its own root: slower, but the same test.
+func (e *env) shareRoots(link, cache string) {
+	target := filepath.Join(cache, "minipg", "roots")
+	if err := os.MkdirAll(target, 0o700); err != nil {
+		e.t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Dir(link), 0o700); err != nil {
+		e.t.Fatal(err)
+	}
+	if err := linkDir(target, link); err != nil {
+		e.t.Logf("not sharing the root cache (%s -> %s): %v", link, target, err)
+	}
+}
+
+// runtimeDir is the parent of minipg's per-.pgdb runtime directories, as
+// paths.zig picks it. On macOS it's per user, not per test: $TMPDIR is left
+// alone, as it is for real users.
+func (e *env) runtimeDir() string {
+	switch runtime.GOOS {
+	case "windows":
+		return filepath.Join(e.dir, "local", "minipg", "run")
+	case "darwin":
+		tmp := os.Getenv("TMPDIR")
+		if tmp == "" {
+			tmp = "/tmp"
+		}
+		return filepath.Join(tmp, fmt.Sprintf("minipg-%d", os.Getuid()))
+	}
+	return filepath.Join(e.dir, "run", "minipg")
+}
+
+// sameDir reports whether got and want name the same directory. got may be
+// a path from a Unix-style shell on Windows (/c/Users/...), and on macOS
+// it may go through /private where want doesn't.
+func sameDir(got, want string) bool {
+	if runtime.GOOS == "windows" && len(got) >= 2 && got[0] == '/' && (len(got) == 2 || got[2] == '/') {
+		got = strings.ToUpper(got[1:2]) + ":" + filepath.FromSlash(got[2:])
+		if len(got) == 2 {
+			got += `\`
+		}
+	}
+	a, err := os.Stat(got)
+	if err != nil {
+		return false
+	}
+	b, err := os.Stat(want)
+	return err == nil && os.SameFile(a, b)
 }
 
 func (e *env) path(name string) string { return filepath.Join(e.dir, name) }
@@ -278,7 +344,9 @@ func TestInit(t *testing.T) {
 	if m["pg.last_opened"] == "" || m["pg.arch"] == "" {
 		t.Errorf("minipg.toml doesn't record the version and arch: %v", m)
 	}
-	if st, err := os.Stat(e.path("app.pgdb/minipg.toml")); err == nil && st.Mode().Perm() != 0o600 {
+	// Windows has no mode bits; the file is the user's through
+	// %LOCALAPPDATA%'s and the directory's ACLs.
+	if st, err := os.Stat(e.path("app.pgdb/minipg.toml")); err == nil && runtime.GOOS != "windows" && st.Mode().Perm() != 0o600 {
 		t.Errorf("minipg.toml mode %v, want 0600", st.Mode().Perm())
 	}
 	if e.status("app.pgdb").running {
@@ -405,8 +473,19 @@ func (e *env) serve(pgdb string, args ...string) (*exec.Cmd, *bytes.Buffer) {
 		e.t.Fatal(err)
 	}
 	e.t.Cleanup(func() {
-		c.Process.Signal(syscall.SIGINT)
-		c.Wait()
+		if c.ProcessState != nil {
+			return
+		}
+		e.interrupt(c, pgdb)
+		done := make(chan struct{})
+		go func() { c.Wait(); close(done) }()
+		select {
+		case <-done:
+		case <-time.After(45 * time.Second):
+			e.t.Errorf("serve %s didn't exit; killing it", pgdb)
+			c.Process.Kill()
+			<-done
+		}
 	})
 	waitFor(e.t, "serve to be ready", 2*time.Minute, func() bool {
 		return strings.Contains(out.String(), "minipg: ready")
@@ -434,8 +513,10 @@ func TestServe(t *testing.T) {
 	if logs := e.must("logs", "app.pgdb"); !strings.Contains(logs, "ready on 127.0.0.1") {
 		t.Errorf("logs: %q", logs)
 	}
-	// Ctrl-C: a clean shutdown and exit 0.
-	c.Process.Signal(syscall.SIGINT)
+	// Ctrl-C (`minipg stop` on Windows): a clean shutdown and exit 0.
+	if err := e.interrupt(c, "app.pgdb"); err != nil {
+		t.Fatalf("interrupt: %v", err)
+	}
 	done := make(chan error, 1)
 	go func() { done <- c.Wait() }()
 	select {
@@ -444,7 +525,7 @@ func TestServe(t *testing.T) {
 			t.Errorf("serve exited: %v\n%s", err, out)
 		}
 	case <-time.After(45 * time.Second):
-		t.Fatal("serve didn't exit after SIGINT")
+		t.Fatal("serve didn't exit after an interrupt")
 	}
 	if !strings.Contains(out.String(), "database system is shut down") {
 		t.Errorf("no clean shutdown in the log:\n%s", out)
@@ -518,17 +599,26 @@ func freePort(t *testing.T) int {
 	return l.Addr().(*net.TCPAddr).Port
 }
 
-// runJSON reads a running server's run.json.
+// runJSON reads a running server's run.json. On macOS the runtime
+// directory is shared with other tests (and the user's own servers), so
+// it matches the .pgdb by identity, not by name.
 func runJSON(t *testing.T, e *env, pgdb string) map[string]any {
 	t.Helper()
-	matches, _ := filepath.Glob(filepath.Join(e.dir, "run", "minipg", "*", "run.json"))
+	matches, _ := filepath.Glob(filepath.Join(e.runtimeDir(), "*", "run.json"))
 	for _, m := range matches {
 		b, err := os.ReadFile(m)
 		if err != nil {
 			continue
 		}
 		var v map[string]any
-		if json.Unmarshal(b, &v) == nil && strings.HasSuffix(fmt.Sprint(v["pgdb"]), pgdb) {
+		if json.Unmarshal(b, &v) != nil {
+			continue
+		}
+		p := fmt.Sprint(v["pgdb"])
+		if !filepath.IsAbs(p) {
+			p = filepath.Join(e.dir, p)
+		}
+		if sameDir(p, e.path(pgdb)) {
 			return v
 		}
 	}
@@ -542,7 +632,7 @@ func TestRuntimeFiles(t *testing.T) {
 	e.query("app.pgdb", "select 1")
 	v := runJSON(t, e, "app.pgdb")
 	sock := fmt.Sprint(v["control"])
-	if st, err := os.Stat(filepath.Dir(sock)); err != nil || st.Mode().Perm() != 0o700 {
+	if st, err := os.Stat(filepath.Dir(sock)); err != nil || (runtime.GOOS != "windows" && st.Mode().Perm() != 0o700) {
 		t.Errorf("runtime dir: %v %v", err, st)
 	}
 	if v["protocol"] != float64(1) {
