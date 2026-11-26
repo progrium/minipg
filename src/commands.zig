@@ -16,6 +16,7 @@ const net = @import("net.zig");
 const paths = @import("paths.zig");
 const pgwire = @import("pgwire.zig");
 const host = @import("host.zig");
+const sys = @import("sys.zig");
 
 const Pgdb = pgdb_mod.Pgdb;
 
@@ -406,19 +407,45 @@ pub fn envCmd(ctx: Ctx, args: cli.Args) !u8 {
 pub fn run(ctx: Ctx, args: cli.Args) !u8 {
     const path = args.pgdb() orelse return usageError(ctx, "run needs a .pgdb path", .{});
     const argv = if (args.rest.len > 0) args.rest else if (args.positional.len > 1) args.positional[1..] else return usageError(ctx, "run needs a command: minipg run {s} -- CMD [args]", .{path});
+    // --stop: stop the server this started once the command exits, and
+    // pass SIGINT and SIGTERM on to the command rather than exiting first.
+    const stop_after = args.has(&.{"stop"});
+    if (stop_after) sys.Forward.install();
     const p = openOrCreate(ctx, args, path) orelse return 1;
-    const r = ensureServer(ctx, p) catch |err| switch (err) {
+    var r = ensureServer(ctx, p) catch |err| switch (err) {
         error.Reported => return 1,
         else => return err,
     };
     // ensureServer's hold keeps the server open while the command runs,
     // whether or not it has connected yet.
+    const code = try runCommand(ctx, args, p, r, argv);
+    if (stop_after and r.child != null) {
+        // Let go of the server first, so nothing of this process holds it.
+        if (r.hold) |h| h.close(ctx.io);
+        r.hold = null;
+        client.stop(ctx, p, r) catch |err| {
+            ctx.warn("stopping the server for {s}: {t}", .{ path, err });
+            return if (code == 0) 1 else code;
+        };
+    }
+    return code;
+}
+
+/// Runs `run`'s command with the server's connection settings in its
+/// environment, and returns its exit code.
+fn runCommand(ctx: Ctx, args: cli.Args, p: Pgdb, r: client.Running, argv: []const []const u8) !u8 {
+    // A signal while the server was starting: don't start the command.
+    if (sys.Forward.received()) |sig| return 128 +| sig;
     const conn = connFor(args, p, r);
     var env_map = try ctx.env.clone(ctx.arena);
     try env_map.put("DATABASE_URL", try conn.url(ctx.arena));
     for (try conn.pgEnv(ctx.arena)) |v| try env_map.put(v.name, v.value);
-    var child = std.process.spawn(ctx.io, .{ .argv = argv, .environ_map = &env_map }) catch |err|
-        return ctx.fail("{s}: {t}", .{ argv[0], err });
+    var child = std.process.spawn(ctx.io, .{ .argv = argv, .environ_map = &env_map }) catch |err| {
+        ctx.warn("{s}: {t}", .{ argv[0], err });
+        return 1;
+    };
+    sys.Forward.setChild(sys.childPid(child) orelse 0);
+    defer sys.Forward.setChild(0);
     const term = try child.wait(ctx.io);
     return switch (term) {
         .exited => |code| code,

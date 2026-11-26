@@ -45,6 +45,7 @@ pub const win = struct {
     pub extern "kernel32" fn GetStdHandle(which: DWORD) callconv(.winapi) ?HANDLE;
     pub extern "kernel32" fn GetHandleInformation(h: HANDLE, flags: *DWORD) callconv(.winapi) BOOL;
     pub extern "kernel32" fn SetHandleInformation(h: HANDLE, mask: DWORD, flags: DWORD) callconv(.winapi) BOOL;
+    pub extern "kernel32" fn SetConsoleCtrlHandler(handler: ?*const fn (DWORD) callconv(.winapi) BOOL, add: BOOL) callconv(.winapi) BOOL;
     pub const HANDLE_FLAG_INHERIT: DWORD = 1;
 };
 
@@ -76,6 +77,71 @@ pub const StdNoInherit = struct {
         for (s.handles) |h| if (h) |x| {
             _ = win.SetHandleInformation(x, win.HANDLE_FLAG_INHERIT, win.HANDLE_FLAG_INHERIT);
         };
+    }
+};
+
+/// For `run --stop`: SIGINT and SIGTERM no longer end minipg, which has a
+/// server to stop first. They're passed on to the command instead, which
+/// a signal sent to minipg alone (not its process group) wouldn't reach.
+/// On Windows, Ctrl-C and Ctrl-Break, which the command already gets from
+/// the console it shares, are ignored; closing the console still ends
+/// minipg, and the server then stops when it idles out.
+pub const Forward = struct {
+    /// The command's pid once it runs, 0 before and after.
+    var child: std.atomic.Value(i32) = .init(0);
+    /// The first signal received, 0 if none.
+    var got: std.atomic.Value(i32) = .init(0);
+
+    pub fn install() void {
+        if (is_windows) {
+            _ = win.SetConsoleCtrlHandler(null, .FALSE);
+            _ = win.SetConsoleCtrlHandler(consoleHandler, .TRUE);
+            return;
+        }
+        const posix = std.posix;
+        const act: posix.Sigaction = .{
+            .handler = .{ .handler = handler },
+            .mask = posix.sigemptyset(),
+            .flags = posix.SA.RESTART,
+        };
+        var set = posix.sigemptyset();
+        for ([_]posix.SIG{ .INT, .TERM }) |sig| {
+            posix.sigaction(sig, &act, null);
+            posix.sigaddset(&set, sig);
+        }
+        posix.sigprocmask(posix.SIG.UNBLOCK, &set, null);
+    }
+
+    /// Sets the command's pid, or 0 once it has exited. A signal that came
+    /// before the command started is passed on now.
+    pub fn setChild(id: i32) void {
+        child.store(id, .release);
+        if (is_windows or id <= 0) return;
+        const sig = got.load(.acquire);
+        if (sig != 0) _ = std.c.kill(id, @enumFromInt(sig));
+    }
+
+    /// The first SIGINT or SIGTERM received, if any.
+    pub fn received() ?u8 {
+        const sig = got.load(.acquire);
+        return if (sig == 0) null else @intCast(sig);
+    }
+
+    fn handler(sig: std.posix.SIG) callconv(.c) void {
+        const e = std.c._errno().*;
+        defer std.c._errno().* = e;
+        const n: i32 = @intCast(@intFromEnum(sig));
+        _ = got.cmpxchgStrong(0, n, .acq_rel, .acquire);
+        const id = child.load(.acquire);
+        if (id > 0) _ = std.c.kill(id, sig);
+    }
+
+    fn consoleHandler(ev: win.DWORD) callconv(.winapi) win.BOOL {
+        // CTRL_C_EVENT, CTRL_BREAK_EVENT.
+        if (ev != 0 and ev != 1) return .FALSE;
+        // Windows' SIGINT, for the exit code.
+        _ = got.cmpxchgStrong(0, 2, .acq_rel, .acquire);
+        return .TRUE;
     }
 };
 

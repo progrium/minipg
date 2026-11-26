@@ -49,7 +49,7 @@ Every command takes the `.pgdb` first; a bare path is shorthand for `shell`. `-d
 | `logs <pgdb> [-f]` | The server's recent log (a 4 MB window), or the last server's log file |
 | `exec <pgdb> -- TOOL [args]` | Run a Postgres tool (pg_dump, pg_restore, psql, ...) against the server, with `PG*` set |
 | `env <pgdb>` | `DATABASE_URL` and `PG*` as shell exports: `eval "$(minipg env app.pgdb)"`; on Windows, PowerShell assignments: `minipg env app.pgdb \| Invoke-Expression` |
-| `run <pgdb> -- CMD [args]` | Run a host command with `DATABASE_URL` and `PG*` set; the server stays up until it exits, and its exit code is minipg's |
+| `run <pgdb> [--stop] -- CMD [args]` | Run a host command with `DATABASE_URL` and `PG*` set; the server stays up until it exits, and its exit code is minipg's. `--stop` stops the server it started when the command exits, and passes SIGINT/SIGTERM on to it |
 | `dump <pgdb> [pg_dump args]` | `pg_dump` to stdout (plain SQL unless args say otherwise) |
 | `restore <pgdb> [FILE]` | Restore a plain SQL or custom-format dump from FILE or stdin; stops at the first error |
 | `dbs <pgdb>` | List databases, the default marked `*` |

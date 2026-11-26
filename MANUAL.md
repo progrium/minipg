@@ -196,6 +196,12 @@ minipg run app.pgdb -- npm start
 minipg run app.pgdb -d test -- pytest
 ```
 
+The server `run` starts outlives it: it's in its own process group, and it stops after `MINIPG_IDLE` seconds without clients. Where nothing will be left running to see that happen, such as an on-demand launcher that signals your app's process group when it goes idle and then tears down its container or PID namespace, add `--stop`. `run --stop` stops the server it started (a fast, clean Postgres shutdown) once the command exits, before minipg does. While the command runs, SIGINT and SIGTERM don't end minipg; they're passed on to the command, which exits, and minipg then stops the server. A server that was already running when `run` began is left alone.
+
+```sh
+minipg run --stop data/miniflux.pgdb -- miniflux
+```
+
 **`env`** prints the same variables as shell exports:
 
 ```sh
@@ -545,9 +551,11 @@ Prints a `postgres://user:password@host:port/database` URL, with the running ser
 
 Prints `DATABASE_URL`, `PGHOST`, `PGPORT`, `PGUSER`, `PGPASSWORD`, and `PGDATABASE` as shell-quoted `export` lines, or on Windows as PowerShell `$env:NAME = 'value'` lines. Doesn't start a server. **Creates.**
 
-#### `run <pgdb> [-d DB] -- CMD [args]`
+#### `run <pgdb> [-d DB] [--stop] -- CMD [args]`
 
 Starts a server if needed, then runs CMD on the host with the same variables `env` prints, holding the server open until CMD exits. Exits with CMD's exit code, or 128 plus the signal number if CMD was killed by a signal. **Creates.**
+
+With `--stop`, a server that `run` started is stopped cleanly after CMD exits, and SIGINT and SIGTERM sent to minipg are passed on to CMD instead of ending minipg first. A signal that arrives while the server is still starting skips CMD. If stopping the server fails, minipg says so and exits 1 (or CMD's exit code, if that wasn't 0). On Windows, Ctrl-C and Ctrl-Break reach CMD through the console and minipg waits for it; closing the console still ends minipg, and the server then idles out.
 
 #### `logs <pgdb> [-f]`
 
