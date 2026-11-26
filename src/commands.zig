@@ -411,11 +411,8 @@ pub fn run(ctx: Ctx, args: cli.Args) !u8 {
         error.Reported => return 1,
         else => return err,
     };
-    // Hold the server open while the command runs, whether or not it has
-    // connected yet.
-    const hold = control.hold(ctx.io, r.info.control) catch null;
-    defer if (hold) |h| h.close(ctx.io);
-
+    // ensureServer's hold keeps the server open while the command runs,
+    // whether or not it has connected yet.
     const conn = connFor(args, p, r);
     var env_map = try ctx.env.clone(ctx.arena);
     try env_map.put("DATABASE_URL", try conn.url(ctx.arena));

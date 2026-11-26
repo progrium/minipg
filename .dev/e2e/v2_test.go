@@ -28,6 +28,15 @@ func TestIdleTimeout(t *testing.T) {
 	if got := e.query("app.pgdb", "select 2"); got != "2" {
 		t.Errorf("query after idle stop: %q", got)
 	}
+
+	// A tool that's slow to connect, as a tool machine booting on a slow
+	// host can be, still finds the server it was started against: the
+	// command holds it open until it exits.
+	e.must("stop", "app.pgdb")
+	out, errs, code := e.runWith("", []string{"MINIPG_IDLE=1"}, "exec", "app.pgdb", "--", "sh", "-c", "sleep 4; psql -tAX -c 'select 3'")
+	if code != 0 || strings.TrimSpace(out) != "3" {
+		t.Errorf("slow tool: %q, %s", out, errs)
+	}
 }
 
 func TestEnvAndRun(t *testing.T) {

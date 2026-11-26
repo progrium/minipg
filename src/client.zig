@@ -4,7 +4,8 @@
 //! server is running and run.json says where its control socket is.
 //! Otherwise the command starts `minipg serve --background` as a separate
 //! process in its own process group, waits for it to report ready, and
-//! connects. That server stops after MINIPG_IDLE seconds without clients.
+//! connects, holding the server open until the command exits. That server
+//! stops after MINIPG_IDLE seconds without clients or holds.
 
 const std = @import("std");
 const Ctx = @import("ctx.zig").Ctx;
@@ -23,6 +24,9 @@ pub const Running = struct {
     runtime: []const u8,
     /// The server this command started, if it did.
     child: ?std.process.Child = null,
+    /// A `hold` on the server, from `ensure`: it keeps the server from
+    /// idling out under this command until the process exits.
+    hold: ?std.Io.net.Stream = null,
 };
 
 pub fn runtimeDir(ctx: Ctx, p: Pgdb) ![]const u8 {
@@ -66,10 +70,30 @@ pub const EnsureOptions = struct {
     idle_timeout: i64 = default_idle,
 };
 
-/// The running server, or a new background one, once it's ready.
+/// The running server, or a new background one, once it's ready, held
+/// open for the rest of this process (see `Running.hold`).
+///
+/// A server found idling out is waited for and replaced: an idle timeout
+/// can expire between finding the server and holding it, or, where control
+/// requests are slow (Windows), while waiting for it to be ready.
 pub fn ensure(ctx: Ctx, p: Pgdb, opts: EnsureOptions) !Running {
-    if (try find(ctx, p)) |r| {
-        try waitReady(ctx, r, null);
+    var attempts: u32 = 0;
+    while (true) : (attempts += 1) {
+        return ensureOnce(ctx, p, opts) catch |err| switch (err) {
+            error.ServerStopping => {
+                if (attempts >= 3) return err;
+                try waitUnlocked(ctx, p);
+                continue;
+            },
+            else => return err,
+        };
+    }
+}
+
+fn ensureOnce(ctx: Ctx, p: Pgdb, opts: EnsureOptions) !Running {
+    if (try find(ctx, p)) |found| {
+        var r = found;
+        try holdReady(ctx, &r, null);
         return r;
     }
     var r: Running = .{ .info = undefined, .runtime = try runtimeDir(ctx, p) };
@@ -88,8 +112,31 @@ pub fn ensure(ctx: Ctx, p: Pgdb, opts: EnsureOptions) !Running {
         if (tries > 600) return error.ServerTimeout;
         try ctx.io.sleep(.fromMilliseconds(50), .awake);
     }
-    try waitReady(ctx, r, p);
+    try holdReady(ctx, &r, p);
     return r;
+}
+
+/// Holds the server, then waits for it to be ready. Held first, so the
+/// idle timeout can't start between its becoming ready and this command
+/// connecting. A server that can't be held is still used, as before holds.
+fn holdReady(ctx: Ctx, r: *Running, starting: ?Pgdb) !void {
+    r.hold = control.hold(ctx.io, r.info.control) catch null;
+    errdefer if (r.hold) |h| {
+        h.close(ctx.io);
+        r.hold = null;
+    };
+    try waitReady(ctx, r.*, starting);
+}
+
+/// Waits for a stopping server to release the .pgdb's lock.
+fn waitUnlocked(ctx: Ctx, p: Pgdb) !void {
+    // Postgres's fast shutdown, or the 30s limit after which the server
+    // stops the machine.
+    var tries: u32 = 0;
+    while (pgdb_mod.locked(ctx.arena, ctx.io, p)) : (tries += 1) {
+        if (tries > 400) return error.StopTimeout;
+        try ctx.io.sleep(.fromMilliseconds(100), .awake);
+    }
 }
 
 fn spawn(ctx: Ctx, p: Pgdb, opts: EnsureOptions) !std.process.Child {
@@ -167,11 +214,5 @@ pub fn stop(ctx: Ctx, p: Pgdb, r: Running) !void {
         ctx.warn("server: {s}", .{reply.body});
         return error.Refused;
     }
-    // Postgres's fast shutdown, or the 30s limit after which the server
-    // stops the machine.
-    var tries: u32 = 0;
-    while (pgdb_mod.locked(ctx.arena, ctx.io, p)) : (tries += 1) {
-        if (tries > 400) return error.StopTimeout;
-        try ctx.io.sleep(.fromMilliseconds(100), .awake);
-    }
+    try waitUnlocked(ctx, p);
 }
