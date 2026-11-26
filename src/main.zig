@@ -95,6 +95,7 @@ test {
     _ = @import("logwin.zig");
     _ = @import("net.zig");
     _ = @import("paths.zig");
+    _ = @import("pgconf.zig");
     _ = @import("pgdb.zig");
     _ = @import("pgwire.zig");
     _ = @import("layer.zig");
