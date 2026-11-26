@@ -59,8 +59,11 @@ pub fn runJsonPath(arena: std.mem.Allocator, runtime_dir: []const u8) ![]const u
     return std.fs.path.join(arena, &.{ runtime_dir, "run.json" });
 }
 
-pub fn socketPath(arena: std.mem.Allocator, runtime_dir: []const u8) ![]const u8 {
-    return std.fs.path.join(arena, &.{ runtime_dir, "control.sock" });
+/// The control socket for the .pgdb with key `key`: control.sock in its
+/// runtime directory, unless that path is too long for a unix socket
+/// (paths.socketPath). run.json names it, so clients needn't work it out.
+pub fn socketPath(arena: std.mem.Allocator, runtime_dir: []const u8, key: []const u8) ![]const u8 {
+    return paths.socketPath(arena, runtime_dir, "control.sock", try std.fmt.allocPrint(arena, "{s}.sock", .{key}));
 }
 
 pub fn readRunInfo(arena: std.mem.Allocator, io: std.Io, runtime_dir: []const u8) !RunInfo {

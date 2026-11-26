@@ -17,7 +17,13 @@
 //! renames. Linux falls back to ~/.cache/minipg/run/ without
 //! XDG_RUNTIME_DIR, and honors XDG_STATE_HOME and XDG_CACHE_HOME. Runtime
 //! directories are mode 0700; on Windows, %LOCALAPPDATA% is already the
-//! user's own.
+//! user's own. On macOS, $TMPDIR is taken by its real path (/var is a
+//! symlink to /private/var).
+//!
+//! A unix socket's path has a small limit (103 bytes on macOS, 107 on
+//! Linux). When the control socket's path in the runtime directory would
+//! be longer, it goes in /tmp/minipg-$UID/<key>.sock instead; run.json,
+//! which names it, stays in the runtime directory.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -61,7 +67,7 @@ pub fn dirs(arena: std.mem.Allocator, env: *const Environ.Map) !Dirs {
     }
     const home = get(env, "HOME") orelse return error.NoHomeDir;
     if (builtin.os.tag == .macos) {
-        const tmp = get(env, "TMPDIR") orelse "/tmp";
+        const tmp = try realPath(arena, get(env, "TMPDIR") orelse "/tmp");
         return .{
             .runtime = try std.fmt.allocPrint(arena, "{s}/minipg-{d}", .{ std.mem.trimEnd(u8, tmp, "/"), std.c.getuid() }),
             .logs = try std.fs.path.join(arena, &.{ home, "Library/Logs/minipg" }),
@@ -79,6 +85,57 @@ pub fn dirs(arena: std.mem.Allocator, env: *const Environ.Map) !Dirs {
         .logs = try std.fs.path.join(arena, &.{ state, "minipg/logs" }),
         .roots = try std.fs.path.join(arena, &.{ cache, "minipg/roots" }),
     };
+}
+
+/// `path` with symlinks resolved, or `path` itself if it can't be.
+fn realPath(arena: std.mem.Allocator, path: []const u8) ![]const u8 {
+    var buf: [std.c.PATH_MAX]u8 = undefined;
+    const r = std.c.realpath(try arena.dupeZ(u8, path), &buf) orelse return path;
+    return arena.dupe(u8, std.mem.sliceTo(r, 0));
+}
+
+/// The longest path a unix socket can have: sun_path less its NUL.
+/// Windows has no such limit that std doesn't already handle.
+pub const socket_path_max = if (sys.is_windows)
+    std.Io.net.UnixAddress.max_len
+else
+    @typeInfo(@FieldType(std.c.sockaddr.un, "path")).array.len - 1;
+
+/// Where a socket named `name` in `dir` goes: there, when its path fits
+/// in a unix socket address, else /tmp/minipg-$UID/<fallback>, a short
+/// private directory. Not on Windows, which needs no fallback.
+pub fn socketPath(arena: std.mem.Allocator, dir: []const u8, name: []const u8, fallback: []const u8) ![]const u8 {
+    const p = try std.fs.path.join(arena, &.{ dir, name });
+    if (sys.is_windows or p.len <= socket_path_max) return p;
+    const short = try std.fmt.allocPrint(arena, "/tmp/minipg-{d}", .{std.c.getuid()});
+    try makeOwnedPrivateDir(arena, short);
+    const q = try std.fs.path.join(arena, &.{ short, fallback });
+    if (q.len > socket_path_max) return error.NameTooLong;
+    return q;
+}
+
+/// Makes `path` a directory only this user can use, refusing one that
+/// someone else made first or that is a symlink: /tmp is shared.
+fn makeOwnedPrivateDir(arena: std.mem.Allocator, path: []const u8) !void {
+    const z = try arena.dupeZ(u8, path);
+    _ = std.c.mkdir(z, 0o700);
+    const st = try lstatOwner(z);
+    if (st.mode & std.c.S.IFMT != std.c.S.IFDIR or st.uid != std.c.getuid()) return error.AccessDenied;
+    if (st.mode & 0o777 != 0o700 and std.c.chmod(z, 0o700) != 0) return error.AccessDenied;
+}
+
+/// A path's mode and owner, not following a final symlink. statx on
+/// Linux, where std.c has no fstatat; fstatat elsewhere (see `key`).
+fn lstatOwner(z: [:0]const u8) !struct { mode: u32, uid: u32 } {
+    if (builtin.os.tag == .linux) {
+        const linux = std.os.linux;
+        var st: linux.Statx = undefined;
+        if (linux.errno(linux.statx(linux.AT.FDCWD, z, linux.AT.SYMLINK_NOFOLLOW, .{ .TYPE = true, .MODE = true, .UID = true }, &st)) != .SUCCESS) return error.FileNotFound;
+        return .{ .mode = st.mode, .uid = st.uid };
+    }
+    var st: std.c.Stat = undefined;
+    if (std.c.fstatat(std.c.AT.FDCWD, z, &st, std.c.AT.SYMLINK_NOFOLLOW) != 0) return error.FileNotFound;
+    return .{ .mode = @intCast(st.mode), .uid = @intCast(st.uid) };
 }
 
 /// The key for a .pgdb directory: its device and inode, hashed.
@@ -131,6 +188,19 @@ pub fn writeAtomic(io: std.Io, arena: std.mem.Allocator, path: []const u8, data:
         cwd.deleteFile(io, tmp) catch {};
         return err;
     };
+}
+
+test socketPath {
+    if (sys.is_windows) return;
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    try std.testing.expectEqualStrings("/run/x/control.sock", try socketPath(a, "/run/x", "control.sock", "k.sock"));
+    const long = "/" ++ "d" ** 120;
+    const p = try socketPath(a, long, "control.sock", "k.sock");
+    try std.testing.expect(p.len <= socket_path_max);
+    try std.testing.expect(std.mem.startsWith(u8, p, "/tmp/minipg-"));
+    try std.testing.expect(std.mem.endsWith(u8, p, "/k.sock"));
 }
 
 test key {

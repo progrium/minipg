@@ -39,7 +39,13 @@ func TestEnvAndRun(t *testing.T) {
 	}
 	url := e.url("app.pgdb")
 	got := e.must("run", "app.pgdb", "--", "sh", "-c", `echo "$DATABASE_URL|$PGDATABASE|$PWD"`)
-	want := url + "|app|" + e.dir
+	// The shell's $PWD is the real path: on macOS the temp dir is under
+	// /var, a symlink to /private/var.
+	dir, err := filepath.EvalSymlinks(e.dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := url + "|app|" + dir
 	if strings.TrimSpace(got) != want {
 		t.Errorf("run: %q, want %q", got, want)
 	}
