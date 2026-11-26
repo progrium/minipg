@@ -102,12 +102,36 @@ func (e *env) run(args ...string) (string, string, int) {
 	return e.runWith("", nil, args...)
 }
 
+// cmdTimeout bounds one minipg command (MINIPG_E2E_CMD_TIMEOUT, default
+// 15m): one that hangs is killed and fails its test, rather than holding
+// the suite until go test's own timeout.
+var cmdTimeout = func() time.Duration {
+	if d, err := time.ParseDuration(os.Getenv("MINIPG_E2E_CMD_TIMEOUT")); err == nil && d > 0 {
+		return d
+	}
+	return 15 * time.Minute
+}()
+
 func (e *env) runWith(stdin string, extra []string, args ...string) (string, string, int) {
 	e.t.Helper()
 	c := e.cmd(stdin, extra, args...)
 	var out, errb bytes.Buffer
 	c.Stdout, c.Stderr = &out, &errb
-	err := c.Run()
+	// A killed command's leftover children mustn't hold its output open.
+	c.WaitDelay = 5 * time.Second
+	if err := c.Start(); err != nil {
+		e.t.Fatalf("minipg %v: %v", args, err)
+	}
+	done := make(chan error, 1)
+	go func() { done <- c.Wait() }()
+	var err error
+	select {
+	case err = <-done:
+	case <-time.After(cmdTimeout):
+		c.Process.Kill()
+		<-done
+		e.t.Fatalf("minipg %v hung: still running after %v (MINIPG_E2E_CMD_TIMEOUT)\nstdout: %s\nstderr: %s", args, cmdTimeout, tail(out.String(), 20), tail(errb.String(), 20))
+	}
 	code := 0
 	if err != nil {
 		ee, ok := err.(*exec.ExitError)
@@ -528,4 +552,13 @@ func TestRuntimeFiles(t *testing.T) {
 	if _, err := os.Stat(sock); err == nil {
 		t.Errorf("control socket left behind")
 	}
+}
+
+// tail is the last n lines of s.
+func tail(s string, n int) string {
+	lines := strings.Split(strings.TrimRight(s, "\n"), "\n")
+	if len(lines) > n {
+		lines = lines[len(lines)-n:]
+	}
+	return strings.Join(lines, "\n")
 }

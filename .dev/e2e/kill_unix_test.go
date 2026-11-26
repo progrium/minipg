@@ -9,3 +9,8 @@ import "syscall"
 func killServer(pid int) error {
 	return syscall.Kill(-pid, syscall.SIGKILL)
 }
+
+// killPid SIGKILLs one host process.
+func killPid(pid int) error {
+	return syscall.Kill(pid, syscall.SIGKILL)
+}

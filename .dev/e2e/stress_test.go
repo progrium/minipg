@@ -15,25 +15,35 @@ package e2e
 //	STRESS_SCALE   pgbench scale factor (default 10, about 160 MB)
 //	STRESS_SEED    random seed, to replay a run (default: the time)
 //	STRESS_RUN     a -run pattern, through make (default Stress)
+//	STRESS_PGCHECKSUMS=tool  run pg_checksums in a tool machine even where
+//	               the host could run the root's own binary
+//	MINIPG_E2E_CMD_TIMEOUT  how long one minipg command may run (default 15m)
 //
 // Every cluster is initialized with --data-checksums, and every check ends
 // with amcheck over all btree indexes and the heap, and a pg_checksums pass
 // over the stopped cluster.
+//
+// It runs on Linux, macOS and Windows. The kills that target h9 stubs (the
+// stub crash round and TestStressIdleStubDeath) need h9's native backend
+// and skip on a hypervisor (KVM, HVF, WHP). A client that waits on a server
+// that has stopped answering gives up and fails its test rather than
+// hanging the suite.
 
 import (
 	"context"
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"math/rand"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
-	"syscall"
 	"testing"
 	"time"
 
@@ -91,46 +101,30 @@ func (e *env) start(pgdb string) string {
 	return e.url(pgdb)
 }
 
+// serverPid is the running server's pid, from minipg status, which works
+// wherever minipg keeps its runtime files.
 func (e *env) serverPid(pgdb string) int {
 	e.t.Helper()
-	return int(runJSON(e.t, e, pgdb)["pid"].(float64))
-}
-
-// serverProcs lists a server's host processes: the minipg server itself
-// and, on h9's native backend, its stubs (one per guest address space,
-// each a child of the server in its own process group), by pid, with
-// their names. Zombies are left out.
-func serverProcs(server int) map[int]string {
-	out := map[int]string{}
-	entries, _ := os.ReadDir("/proc")
-	for _, de := range entries {
-		pid, err := strconv.Atoi(de.Name())
-		if err != nil {
-			continue
-		}
-		b, err := os.ReadFile(filepath.Join("/proc", de.Name(), "stat"))
-		if err != nil {
-			continue
-		}
-		s := string(b)
-		i, j := strings.IndexByte(s, '('), strings.LastIndexByte(s, ')')
-		if i < 0 || j < i {
-			continue
-		}
-		f := strings.Fields(s[j+1:])
-		// state ppid pgrp ...
-		if len(f) < 3 || f[0] == "Z" {
-			continue
-		}
-		ppid, _ := strconv.Atoi(f[1])
-		pgrp, _ := strconv.Atoi(f[2])
-		if pid == server || ppid == server || pgrp == server {
-			out[pid] = s[i+1 : j]
+	out, errs, code := e.run("status", pgdb)
+	if code != 0 {
+		e.t.Fatalf("status %s: exit %d: %s", pgdb, code, errs)
+	}
+	for _, line := range strings.Split(out, "\n") {
+		if f := strings.Fields(line); len(f) == 2 && f[0] == "pid" {
+			if pid, err := strconv.Atoi(f[1]); err == nil {
+				return pid
+			}
 		}
 	}
-	return out
+	e.t.Fatalf("no pid in minipg status %s:\n%s", pgdb, out)
+	return 0
 }
 
+// serverProcs, procRSS and tcpSockets differ by host: procs_*_test.go.
+
+// stubs lists a server's h9 stubs. Only h9's native backend has them; on
+// a hypervisor (KVM, HVF, WHP) guest processes aren't host processes, and
+// the Linux build's Postgres processes are plain ones.
 func stubs(server int) []int {
 	var out []int
 	for pid, name := range serverProcs(server) {
@@ -162,6 +156,69 @@ func (e *env) waitStopped(pgdb string, pgid int) {
 	e.t.Logf("lock released %v after the kill", time.Since(start).Round(time.Millisecond))
 }
 
+// requireStubs skips a test that kills h9 stubs on a server that has none:
+// one on a hypervisor (KVM, HVF, WHP), or the Linux build's.
+func requireStubs(t *testing.T, server int) {
+	t.Helper()
+	if len(stubs(server)) == 0 {
+		t.Skipf("server %d has no h9 stubs (its host processes: %v); stub kills need h9's native backend", server, serverProcs(server))
+	}
+}
+
+// Bounds on waits that would otherwise be forever. A client blocked on a
+// server that never answers is a hang to report, not to sit through.
+const (
+	connectTimeout = 30 * time.Second
+	txTimeout      = 2 * time.Minute
+	opTimeout      = 10 * time.Minute
+)
+
+// errHung marks a client that gave up on a server that stopped answering.
+var errHung = errors.New("hung")
+
+// stressConnect connects with a timeout.
+func stressConnect(ctx context.Context, url string) (*pgx.Conn, error) {
+	cfg, err := pgx.ParseConfig(url)
+	if err != nil {
+		return nil, err
+	}
+	cfg.ConnectTimeout = connectTimeout
+	return pgx.ConnectConfig(ctx, cfg)
+}
+
+// hung wraps err in errHung if ctx timed out, rather than being canceled.
+func hung(ctx context.Context, what string, err error) error {
+	if err != nil && errors.Is(ctx.Err(), context.DeadlineExceeded) {
+		return fmt.Errorf("%w: %s: no answer in %v: %v", errHung, what, txTimeout, err)
+	}
+	return err
+}
+
+// waitWithin waits for wait to return, for up to d.
+func waitWithin(wait func(), d time.Duration) bool {
+	done := make(chan struct{})
+	go func() {
+		wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+		return true
+	case <-time.After(d):
+		return false
+	}
+}
+
+// finish cancels a workload and waits for its clients, failing the test if
+// they don't stop.
+func finish(t *testing.T, cancel context.CancelFunc, wait func()) {
+	t.Helper()
+	cancel()
+	if !waitWithin(wait, time.Minute) {
+		t.Fatalf("the workload's clients were still running a minute after being canceled")
+	}
+}
+
 // check runs the integrity checks that work on a running server: amcheck
 // on every btree index (with heapallindexed), verify_heapam on every table,
 // and Postgres's count of checksum failures.
@@ -185,25 +242,34 @@ func (e *env) check(pgdb string) {
 }
 
 // pgChecksums stops the server and runs pg_checksums --check over the
-// stopped cluster. It runs the root's own binary on the host, through the
-// root's musl loader, since minipg has no way to run a tool without a
-// server; it's skipped where that isn't possible.
+// stopped cluster. On Linux, with an unpacked root in the e2e cache, it runs
+// the root's own binary on the host through the root's musl loader.
+// Elsewhere (macOS and Windows keep the root where the loader can't run, or
+// can't run Linux binaries at all) it runs pg_checksums in a tool machine
+// of a helper .pgdb's server: a tool's cwd is the caller's, so it sees the
+// stopped cluster as a relative path. STRESS_PGCHECKSUMS=tool forces that
+// way on Linux too.
 func (e *env) pgChecksums(pgdb string) {
 	e.t.Helper()
 	e.must("stop", pgdb)
-	cache := os.Getenv("MINIPG_E2E_CACHE")
-	if cache == "" {
-		cache = filepath.Join(os.TempDir(), "minipg-e2e-cache")
+	var out []byte
+	var err error
+	if loader, root := e.muslRoot(); loader != "" && os.Getenv("STRESS_PGCHECKSUMS") != "tool" {
+		c := exec.Command(loader, "--library-path", filepath.Join(root, "lib")+":"+filepath.Join(root, "usr/lib")+":"+filepath.Join(root, "usr/local/lib"),
+			filepath.Join(root, "usr/local/bin/pg_checksums"), "--check", "-D", e.path(pgdb+"/pgdata"))
+		out, err = c.CombinedOutput()
+	} else {
+		const helper = "pgchecksums-helper.pgdb"
+		if _, serr := os.Stat(e.path(helper)); serr != nil {
+			e.must("init", helper)
+		}
+		stdout, stderr, code := e.run("exec", helper, "--", "pg_checksums", "--check", "-D", filepath.ToSlash(pgdb)+"/pgdata")
+		out = []byte(stdout + stderr)
+		if code != 0 {
+			err = fmt.Errorf("exit %d (in a tool machine)", code)
+		}
+		e.run("stop", helper)
 	}
-	loaders, _ := filepath.Glob(filepath.Join(cache, "minipg", "roots", "*", "lib", "ld-musl-*.so.1"))
-	if len(loaders) == 0 {
-		e.t.Logf("pg_checksums: no unpacked root with a musl loader under %s; skipped", cache)
-		return
-	}
-	root := filepath.Dir(filepath.Dir(loaders[0]))
-	c := exec.Command(loaders[0], "--library-path", filepath.Join(root, "lib")+":"+filepath.Join(root, "usr/lib")+":"+filepath.Join(root, "usr/local/lib"),
-		filepath.Join(root, "usr/local/bin/pg_checksums"), "--check", "-D", e.path(pgdb+"/pgdata"))
-	out, err := c.CombinedOutput()
 	if err != nil {
 		e.t.Errorf("pg_checksums --check: %v\n%s", err, out)
 		return
@@ -212,6 +278,23 @@ func (e *env) pgChecksums(pgdb string) {
 		e.t.Errorf("pg_checksums --check:\n%s", out)
 	}
 	e.t.Logf("pg_checksums: %s", strings.Join(strings.Fields(string(out)), " "))
+}
+
+// muslRoot finds an unpacked root with a musl loader in the e2e cache, on
+// a Linux host, which can run it.
+func (e *env) muslRoot() (loader, root string) {
+	if runtime.GOOS != "linux" {
+		return "", ""
+	}
+	cache := os.Getenv("MINIPG_E2E_CACHE")
+	if cache == "" {
+		cache = filepath.Join(os.TempDir(), "minipg-e2e-cache")
+	}
+	loaders, _ := filepath.Glob(filepath.Join(cache, "minipg", "roots", "*", "lib", "ld-musl-*.so.1"))
+	if len(loaders) == 0 {
+		return "", ""
+	}
+	return loaders[0], filepath.Dir(filepath.Dir(loaders[0]))
 }
 
 // ---------------------------------------------------------------------------
@@ -259,33 +342,53 @@ func (w *crashWorkload) run(ctx context.Context, url string) (wait func()) {
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		conn, err := pgx.Connect(ctx, url)
-		if err != nil {
-			return
-		}
-		defer conn.Close(context.Background())
-		for ctx.Err() == nil {
-			time.Sleep(time.Duration(200+rnd(800)) * time.Millisecond)
-			if _, err := conn.Exec(ctx, "checkpoint"); err != nil {
-				return
-			}
-			if _, err := conn.Exec(ctx, "insert into bulk (writer, data) select -1, decode(repeat(md5(random()::text), 2000), 'hex') from generate_series(1, 20)"); err != nil {
-				return
-			}
-			conn.Exec(ctx, "delete from bulk where id in (select id from bulk order by id limit 10)")
-		}
+		w.errs[w.writers] = w.checkpointer(ctx, url)
 	}()
 	return wg.Wait
 }
 
+// checkpointer checkpoints and writes big rows until ctx is done or the
+// connection breaks. Only a hang is its error to report.
+func (w *crashWorkload) checkpointer(ctx context.Context, url string) error {
+	conn, err := stressConnect(ctx, url)
+	if err != nil {
+		return nil
+	}
+	defer conn.Close(context.Background())
+	for ctx.Err() == nil {
+		time.Sleep(time.Duration(200+rnd(800)) * time.Millisecond)
+		tctx, cancel := context.WithTimeout(ctx, txTimeout)
+		_, err := conn.Exec(tctx, "checkpoint")
+		if err == nil {
+			_, err = conn.Exec(tctx, "insert into bulk (writer, data) select -1, decode(repeat(md5(random()::text), 2000), 'hex') from generate_series(1, 20)")
+		}
+		if err == nil {
+			conn.Exec(tctx, "delete from bulk where id in (select id from bulk order by id limit 10)")
+		}
+		err = hung(tctx, "checkpointer", err)
+		cancel()
+		if errors.Is(err, errHung) {
+			return err
+		}
+		if err != nil {
+			return nil
+		}
+	}
+	return nil
+}
+
 func (w *crashWorkload) writer(ctx context.Context, url string, id int) error {
-	conn, err := pgx.Connect(ctx, url)
+	conn, err := stressConnect(ctx, url)
 	if err != nil {
 		return err
 	}
 	defer conn.Close(context.Background())
 	var seq int64
-	if err := conn.QueryRow(ctx, "select coalesce(max(seq), 0) from log where writer = $1", id).Scan(&seq); err != nil {
+	qctx, cancel := context.WithTimeout(ctx, txTimeout)
+	err = conn.QueryRow(qctx, "select coalesce(max(seq), 0) from log where writer = $1", id).Scan(&seq)
+	err = hung(qctx, "reading the last seq", err)
+	cancel()
+	if err != nil {
 		return err
 	}
 	w.acked[id].Store(seq)
@@ -300,19 +403,7 @@ func (w *crashWorkload) writer(ctx context.Context, url string, id int) error {
 			a, b = b, a
 		}
 		amt := rnd(50)
-		tx, err := conn.Begin(ctx)
-		if err != nil {
-			return err
-		}
-		batch := &pgx.Batch{}
-		batch.Queue("insert into log values ($1::int, $2::bigint, $3::int, repeat(md5($1::int::text || ':' || $2::bigint::text), $3::int))", id, seq, reps)
-		batch.Queue("update accounts set balance = balance - $2 where id = $1", a, amt)
-		batch.Queue("update accounts set balance = balance + $2 where id = $1", b, amt)
-		if err := tx.SendBatch(ctx, batch).Close(); err != nil {
-			tx.Rollback(context.Background())
-			return err
-		}
-		if err := tx.Commit(ctx); err != nil {
+		if err := w.transact(ctx, conn, id, seq, reps, a, b, amt); err != nil {
 			return err
 		}
 		w.acked[id].Store(seq)
@@ -320,13 +411,37 @@ func (w *crashWorkload) writer(ctx context.Context, url string, id int) error {
 	return nil
 }
 
+// transact commits one writer's transaction, giving up (errHung) on a
+// server that doesn't answer within txTimeout.
+func (w *crashWorkload) transact(ctx context.Context, conn *pgx.Conn, id int, seq int64, reps, a, b, amt int) error {
+	tctx, cancel := context.WithTimeout(ctx, txTimeout)
+	defer cancel()
+	tx, err := conn.Begin(tctx)
+	if err != nil {
+		return hung(tctx, fmt.Sprintf("seq %d: begin", seq), err)
+	}
+	batch := &pgx.Batch{}
+	batch.Queue("insert into log values ($1::int, $2::bigint, $3::int, repeat(md5($1::int::text || ':' || $2::bigint::text), $3::int))", id, seq, reps)
+	batch.Queue("update accounts set balance = balance - $2 where id = $1", a, amt)
+	batch.Queue("update accounts set balance = balance + $2 where id = $1", b, amt)
+	if err := tx.SendBatch(tctx, batch).Close(); err != nil {
+		tx.Rollback(context.Background())
+		return hung(tctx, fmt.Sprintf("seq %d: batch", seq), err)
+	}
+	return hung(tctx, fmt.Sprintf("seq %d: commit", seq), tx.Commit(tctx))
+}
+
 // checkErrs fails the test for a writer that stopped for any reason but
-// its connection going away.
+// its connection going away (or its context ending), and for any client
+// that gave up on a hung server.
 func (w *crashWorkload) checkErrs(t *testing.T) {
 	t.Helper()
 	for i, err := range w.errs {
 		var pe *pgconn.PgError
-		if errors.As(err, &pe) && !strings.HasPrefix(pe.Code, "57") && !strings.HasPrefix(pe.Code, "08") {
+		switch {
+		case errors.Is(err, errHung):
+			t.Errorf("writer %d: %v", i, err)
+		case errors.As(err, &pe) && !strings.HasPrefix(pe.Code, "57") && !strings.HasPrefix(pe.Code, "08"):
 			t.Errorf("writer %d stopped with %v", i, err)
 		}
 	}
@@ -337,7 +452,8 @@ func (w *crashWorkload) verify(t *testing.T, e *env, pgdb string) (rows int64) {
 	t.Helper()
 	conn := e.connect(e.start(pgdb))
 	defer conn.Close(context.Background())
-	ctx := context.Background()
+	ctx, cancel := context.WithTimeout(context.Background(), opTimeout)
+	defer cancel()
 	for id := 0; id < w.writers; id++ {
 		var n, max int64
 		if err := conn.QueryRow(ctx, "select count(*), coalesce(max(seq), 0) from log where writer = $1", id).Scan(&n, &max); err != nil {
@@ -391,6 +507,9 @@ type kill struct {
 	// inPlace kills leave the server up: Postgres reinitializes its
 	// processes and recovers without restarting.
 	inPlace bool
+	// needsStubs kills need h9's native backend, whose guest processes
+	// are host processes (stubs).
+	needsStubs bool
 	// do kills; fresh lists the h9 stubs started since the workload began
 	// (its backends, busy writing).
 	do func(t *testing.T, e *env, pgdb string, server int, fresh []int) string
@@ -398,7 +517,7 @@ type kill struct {
 
 func hostKill(t *testing.T, pids ...int) string {
 	for _, pid := range pids {
-		if err := syscall.Kill(pid, syscall.SIGKILL); err != nil {
+		if err := killPid(pid); err != nil {
 			t.Logf("kill %d: %v", pid, err)
 		}
 	}
@@ -423,37 +542,39 @@ var kills = []kill{
 	// The server and every h9 stub at once: everything minipg runs dies in
 	// the same instant, the closest thing here to a power cut (short of
 	// the host's own page cache).
-	{"all", false, func(t *testing.T, e *env, pgdb string, server int, fresh []int) string {
-		var pids []int
+	{"all", false, false, func(t *testing.T, e *env, pgdb string, server int, fresh []int) string {
+		pids := []int{server}
 		for pid := range serverProcs(server) {
-			pids = append(pids, pid)
+			if pid != server {
+				pids = append(pids, pid)
+			}
 		}
 		return hostKill(t, pids...)
 	}},
 	// Only the minipg server process, leaving h9's stubs to notice.
-	{"server", false, func(t *testing.T, e *env, pgdb string, server int, fresh []int) string {
+	{"server", false, false, func(t *testing.T, e *env, pgdb string, server int, fresh []int) string {
 		return hostKill(t, server)
 	}},
 	// The h9 stub of one busy backend, as the host's OOM killer might: the
 	// guest process vanishes under h9, which reports it to Postgres as an
 	// exit, and Postgres recovers in place.
-	{"stub", true, func(t *testing.T, e *env, pgdb string, server int, fresh []int) string {
+	{"stub", true, true, func(t *testing.T, e *env, pgdb string, server int, fresh []int) string {
 		if len(fresh) == 0 {
 			t.Fatalf("no new h9 stubs under server %d: %v", server, serverProcs(server))
 		}
 		return hostKill(t, fresh[rnd(len(fresh))])
 	}},
 	// The postmaster, from inside the machine; its children follow.
-	{"postmaster", false, func(t *testing.T, e *env, pgdb string, server int, fresh []int) string {
+	{"postmaster", false, false, func(t *testing.T, e *env, pgdb string, server int, fresh []int) string {
 		return guestKill(t, e, pgdb, "select split_part(pg_read_file('postmaster.pid'), E'\\n', 1)")
 	}},
 	// Every client backend that's writing: Postgres reinitializes and
 	// recovers in place.
-	{"backend", true, func(t *testing.T, e *env, pgdb string, server int, fresh []int) string {
+	{"backend", true, false, func(t *testing.T, e *env, pgdb string, server int, fresh []int) string {
 		return guestKill(t, e, pgdb, "select string_agg(pid::text, ' ') from pg_stat_activity where backend_type = 'client backend' and pid <> pg_backend_pid() and datname = current_database()")
 	}},
 	// The WAL writer and the checkpointer.
-	{"walwriter", true, func(t *testing.T, e *env, pgdb string, server int, fresh []int) string {
+	{"walwriter", true, false, func(t *testing.T, e *env, pgdb string, server int, fresh []int) string {
 		return guestKill(t, e, pgdb, "select string_agg(pid::text, ' ') from pg_stat_activity where backend_type in ('walwriter', 'checkpointer')")
 	}},
 }
@@ -470,6 +591,9 @@ func TestStressCrash(t *testing.T) {
 			for r := 1; r <= rounds; r++ {
 				url := e.start("crash.pgdb")
 				server := e.serverPid("crash.pgdb")
+				if k.needsStubs && r == 1 {
+					requireStubs(t, server)
+				}
 				old := map[int]bool{}
 				for _, pid := range stubs(server) {
 					old[pid] = true
@@ -488,8 +612,10 @@ func TestStressCrash(t *testing.T) {
 				if k.inPlace {
 					// The clients see their connections drop; the server
 					// stays up.
-					wait()
-					cancel()
+					if !waitWithin(wait, 90*time.Second) {
+						t.Errorf("round %d: writers still running 90s after the kill; their connections should have dropped\n%s", r, e.hangReport("crash.pgdb"))
+					}
+					finish(t, cancel, wait)
 					waitFor(t, "Postgres to recover in place", 60*time.Second, func() bool {
 						_, _, code := e.run("crash.pgdb", "select 1")
 						return code == 0
@@ -499,8 +625,7 @@ func TestStressCrash(t *testing.T) {
 					}
 				} else {
 					e.waitStopped("crash.pgdb", server)
-					cancel()
-					wait()
+					finish(t, cancel, wait)
 				}
 				w.checkErrs(t)
 				failed := t.Failed()
@@ -537,11 +662,13 @@ func TestStressIdleStubDeath(t *testing.T) {
 	url := e.start("idle.pgdb")
 	e.query("idle.pgdb", "create table r (id int primary key, v int); insert into r values (1, 0)")
 	server := e.serverPid("idle.pgdb")
+	requireStubs(t, server)
 	old := map[int]bool{}
 	for _, pid := range stubs(server) {
 		old[pid] = true
 	}
-	ctx := context.Background()
+	ctx, cancel := context.WithTimeout(context.Background(), opTimeout)
+	defer cancel()
 	holder := e.connect(url)
 	defer holder.Close(ctx)
 	if _, err := holder.Exec(ctx, "begin; update r set v = v + 1 where id = 1"); err != nil {
@@ -582,7 +709,7 @@ func TestStressCrashDuringBulkLoad(t *testing.T) {
 		url := e.start("bulk.pgdb")
 		server := e.serverPid("bulk.pgdb")
 		conn := e.connect(url)
-		ctx := context.Background()
+		ctx, cancel := context.WithTimeout(context.Background(), opTimeout)
 		// One batch that commits, then one that's killed partway.
 		if _, err := conn.Exec(ctx, "insert into big select $1, g, repeat('y', 100) from generate_series(1, 200000) g", r*2); err != nil {
 			t.Fatal(err)
@@ -595,10 +722,17 @@ func TestStressCrashDuringBulkLoad(t *testing.T) {
 		}()
 		time.Sleep(time.Duration(500+rnd(2500)) * time.Millisecond)
 		kills[0].do(t, e, "bulk.pgdb", server, nil)
-		if err := <-done; err == nil {
-			t.Logf("round %d: the big insert finished before the kill", r)
-			committed++
+		select {
+		case err := <-done:
+			if err == nil {
+				t.Logf("round %d: the big insert finished before the kill", r)
+				committed++
+			}
+		case <-time.After(2 * time.Minute):
+			t.Fatalf("round %d: the big insert's client still waiting 2m after the kill", r)
 		}
+		cancel()
+		conn.Close(context.Background())
 		e.waitStopped("bulk.pgdb", server)
 		got := e.query("bulk.pgdb", "select string_agg(format('%s:%s', batch, n), ' ' order by batch) from (select batch, count(*) n from big group by batch) s")
 		for _, f := range strings.Fields(got) {
@@ -635,10 +769,10 @@ func TestStressCrashCopy(t *testing.T) {
 	time.Sleep(3 * time.Second)
 	kills[0].do(t, e, "src.pgdb", server, nil)
 	e.waitStopped("src.pgdb", server)
-	cancel()
-	wait()
-	if out, err := exec.Command("cp", "-a", e.path("src.pgdb"), e.path("copy.pgdb")).CombinedOutput(); err != nil {
-		t.Fatalf("cp: %v %s", err, out)
+	finish(t, cancel, wait)
+	w.checkErrs(t)
+	if err := copyDir(e.path("src.pgdb"), e.path("copy.pgdb")); err != nil {
+		t.Fatalf("copying src.pgdb: %v", err)
 	}
 	rows := w.verify(t, e, "copy.pgdb")
 	t.Logf("the copy has %d rows", rows)
@@ -701,16 +835,7 @@ func (e *env) hangReport(pgdb string) string {
 	out, _, _ := e.run("exec", pgdb, "--", "psql", "-X", "-c",
 		"select pid, state, wait_event, client_port, now() - state_change as for, left(query, 60) as query from pg_stat_activity where backend_type = 'client backend'")
 	b.WriteString(out)
-	port := e.status(pgdb).port
-	tcp, _ := os.ReadFile("/proc/net/tcp")
-	hex := fmt.Sprintf(":%04X", port)
-	b.WriteString("host TCP sockets on the server's port (local remote state tx:rx queues):\n")
-	for _, l := range strings.Split(string(tcp), "\n") {
-		f := strings.Fields(l)
-		if len(f) > 4 && (strings.HasSuffix(f[1], hex) || strings.HasSuffix(f[2], hex)) {
-			fmt.Fprintf(&b, "  %s %s %s %s\n", f[1], f[2], f[3], f[4])
-		}
-	}
+	b.WriteString(tcpSockets(e.status(pgdb).port))
 	return b.String()
 }
 
@@ -743,13 +868,7 @@ func TestStressSoak(t *testing.T) {
 	rss := func() int64 {
 		var total int64
 		for pid := range serverProcs(e.serverPid("soak.pgdb")) {
-			b, _ := os.ReadFile(fmt.Sprintf("/proc/%d/status", pid))
-			for _, l := range strings.Split(string(b), "\n") {
-				if strings.HasPrefix(l, "VmRSS:") {
-					n, _ := strconv.ParseInt(strings.Fields(l)[1], 10, 64)
-					total += n
-				}
-			}
+			total += procRSS(pid)
 		}
 		return total / 1024
 	}
@@ -843,8 +962,15 @@ func TestStressLostUpdates(t *testing.T) {
 				return
 			}
 			defer conn.Close(context.Background())
+			ctx, cancel := context.WithTimeout(context.Background(), opTimeout)
+			defer cancel()
 			for j := 0; j < each; j++ {
-				if _, err := conn.Exec(context.Background(), "update ctr set n = n + 1 where id = 1"); err != nil {
+				if _, err := conn.Exec(ctx, "update ctr set n = n + 1 where id = 1"); err != nil {
+					if ctx.Err() != nil {
+						t.Errorf("increments still running after %v: %v", opTimeout, err)
+						failed.Add(int64(each - j))
+						return
+					}
 					failed.Add(1)
 				}
 			}
@@ -869,7 +995,8 @@ func TestStressLostUpdates(t *testing.T) {
 				return
 			}
 			defer conn.Close(context.Background())
-			ctx := context.Background()
+			ctx, cancel := context.WithTimeout(context.Background(), opTimeout)
+			defer cancel()
 			for j := 0; j < 100; j++ {
 				for {
 					err := pgx.BeginTxFunc(ctx, conn, pgx.TxOptions{IsoLevel: pgx.Serializable}, func(tx pgx.Tx) error {
@@ -973,7 +1100,10 @@ func TestStressConnections(t *testing.T) {
 	// Everyone connected can still work.
 	for _, c := range conns {
 		var one int
-		if err := c.QueryRow(context.Background(), "select 1").Scan(&one); err != nil {
+		qctx, cancel := context.WithTimeout(context.Background(), connectTimeout)
+		err := c.QueryRow(qctx, "select 1").Scan(&one)
+		cancel()
+		if err != nil {
 			t.Errorf("a connected client: %v", err)
 			break
 		}
@@ -1121,22 +1251,24 @@ func TestStressBackupRestore(t *testing.T) {
 	time.Sleep(3 * time.Second)
 	// A custom-format dump under load, and the same snapshot's checksum.
 	conn := e.connect(url)
-	tx, err := conn.BeginTx(context.Background(), pgx.TxOptions{IsoLevel: pgx.RepeatableRead, AccessMode: pgx.ReadOnly})
+	tctx, tcancel := context.WithTimeout(context.Background(), opTimeout)
+	defer tcancel()
+	tx, err := conn.BeginTx(tctx, pgx.TxOptions{IsoLevel: pgx.RepeatableRead, AccessMode: pgx.ReadOnly})
 	if err != nil {
 		t.Fatal(err)
 	}
 	var snap string
-	if err := tx.QueryRow(context.Background(), "select pg_export_snapshot()").Scan(&snap); err != nil {
+	if err := tx.QueryRow(tctx, "select pg_export_snapshot()").Scan(&snap); err != nil {
 		t.Fatal(err)
 	}
 	var want string
-	tx.QueryRow(context.Background(), "select count(*) || ' ' || md5(string_agg(payload, '' order by writer, seq)) from log").Scan(&want)
+	tx.QueryRow(tctx, "select count(*) || ' ' || md5(string_agg(payload, '' order by writer, seq)) from log").Scan(&want)
 	e.must("exec", "live.pgdb", "--", "pg_dump", "-Fc", "--snapshot="+snap, "-f", "live.dump")
 	tx.Rollback(context.Background())
 	conn.Close(context.Background())
 	time.Sleep(2 * time.Second)
-	cancel()
-	wait()
+	finish(t, cancel, wait)
+	w.checkErrs(t)
 
 	e.must("init", "restored.pgdb")
 	if out, errs, code := e.run("restore", "restored.pgdb", "live.dump"); code != 0 {
@@ -1152,8 +1284,8 @@ func TestStressBackupRestore(t *testing.T) {
 
 	// Cold copy of a stopped .pgdb.
 	e.must("stop", "live.pgdb")
-	if out, err := exec.Command("cp", "-a", e.path("live.pgdb"), e.path("cold.pgdb")).CombinedOutput(); err != nil {
-		t.Fatalf("cp: %v %s", err, out)
+	if err := copyDir(e.path("live.pgdb"), e.path("cold.pgdb")); err != nil {
+		t.Fatalf("copying live.pgdb: %v", err)
 	}
 	w.verify(t, e, "cold.pgdb")
 	e.check("cold.pgdb")
@@ -1164,10 +1296,50 @@ func TestStressBackupRestore(t *testing.T) {
 
 func lastLine(s string) string { return tail(s, 1) }
 
-func tail(s string, n int) string {
-	lines := strings.Split(strings.TrimRight(s, "\n"), "\n")
-	if len(lines) > n {
-		lines = lines[len(lines)-n:]
-	}
-	return strings.Join(lines, "\n")
+// copyDir copies a directory tree with its files' modes, as cp -a would,
+// without needing cp (Windows has none).
+func copyDir(src, dst string) error {
+	return filepath.WalkDir(src, func(path string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		rel, err := filepath.Rel(src, path)
+		if err != nil {
+			return err
+		}
+		to := filepath.Join(dst, rel)
+		info, err := d.Info()
+		if err != nil {
+			return err
+		}
+		switch {
+		case d.IsDir():
+			return os.MkdirAll(to, info.Mode().Perm())
+		case d.Type()&fs.ModeSymlink != 0:
+			target, err := os.Readlink(path)
+			if err != nil {
+				return err
+			}
+			return os.Symlink(target, to)
+		case !d.Type().IsRegular():
+			return nil // sockets and the like
+		}
+		in, err := os.Open(path)
+		if err != nil {
+			return err
+		}
+		defer in.Close()
+		out, err := os.OpenFile(to, os.O_WRONLY|os.O_CREATE|os.O_EXCL, info.Mode().Perm())
+		if err != nil {
+			return err
+		}
+		if _, err := io.Copy(out, in); err != nil {
+			out.Close()
+			return err
+		}
+		if err := out.Close(); err != nil {
+			return err
+		}
+		return os.Chtimes(to, info.ModTime(), info.ModTime())
+	})
 }
