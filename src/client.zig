@@ -143,10 +143,21 @@ fn waitReady(ctx: Ctx, r: Running, starting: ?Pgdb) !void {
         if (r.child) |ch| {
             var copy = ch;
             if (sys.childExited(&copy)) |code| return serverFailed(ctx, starting.?, code);
+        } else if (!sys.alive(r.info.pid)) {
+            // A server another command started, gone while this one
+            // waited: don't poll its dead socket for minutes.
+            return error.ServerStopping;
         }
         if (status(ctx, r)) |st| {
             if (std.mem.eql(u8, st.state, "ready")) return;
-            if (std.mem.eql(u8, st.state, "stopping")) return error.ServerStopping;
+            if (std.mem.eql(u8, st.state, "stopping")) {
+                // The server this command started stopped before it was
+                // ready: its machine exited, and the reason is in its log.
+                // Wait for the process, so the user sees that, not just
+                // ServerStopping.
+                if (r.child) |ch| return waitFailed(ctx, ch, starting.?);
+                return error.ServerStopping;
+            }
         } else |err| switch (err) {
             error.ProtocolMismatch => return err,
             else => {},
@@ -158,6 +169,26 @@ fn waitReady(ctx: Ctx, r: Running, starting: ?Pgdb) !void {
         try ctx.io.sleep(.fromMilliseconds(100), .awake);
     }
     return error.ServerTimeout;
+}
+
+/// Waits for a server this command started, which is stopping before it
+/// was ready, to exit, and reports it with its log's tail.
+fn waitFailed(ctx: Ctx, child: std.process.Child, p: Pgdb) !void {
+    var copy = child;
+    // The server joins its monitor and closes its log after the machine
+    // exits: a few seconds at most.
+    var tries: u32 = 0;
+    while (tries < 600) : (tries += 1) {
+        if (sys.childExited(&copy)) |code| {
+            // Exit 0 is a stop asked for from elsewhere, not a failure.
+            if (code == 0) return error.ServerStopping;
+            return serverFailed(ctx, p, code);
+        }
+        try ctx.io.sleep(.fromMilliseconds(100), .awake);
+    }
+    ctx.warn("the server for {s} stopped before it was ready; its log ends:", .{p.path});
+    printLogTail(ctx, p, 20);
+    return error.ServerFailed;
 }
 
 /// Asks the server to stop and waits until its lock is free.
