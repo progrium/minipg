@@ -68,10 +68,12 @@ jobs:
   # Windows Hypervisor Platform that GitHub's runners lack. It tests the
   # minipg.exe the Linux job cross-compiled, the binary a release ships.
   # Self-hosted, so it runs only for branches of this repository, never a
-  # fork's pull request.
+  # fork's pull request. It's off until the repository variable
+  # WINDOWS_E2E is 1: the runner has to be registered for this repository
+  # and online (its host isn't always up), or the job queues forever.
   windows-amd64-e2e:
     needs: linux-amd64
-    if: github.event_name == 'push' || github.event.pull_request.head.repo.full_name == github.repository
+    if: vars.WINDOWS_E2E == '1' && (github.event_name == 'push' || github.event.pull_request.head.repo.full_name == github.repository)
     runs-on: [self-hosted, h9-whp]
     timeout-minutes: 30
     defaults:
