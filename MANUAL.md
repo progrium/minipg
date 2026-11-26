@@ -280,6 +280,8 @@ There are two ways to set Postgres configuration parameters:
 - For one server run, pass them to `serve` after `--`: `minipg serve app.pgdb -- -c shared_buffers=256MB -c log_statement=all`.
 - To keep them, use `ALTER SYSTEM` from a shell, which writes `pgdata/postgresql.auto.conf` inside the `.pgdb`, then restart the server: `minipg app.pgdb "alter system set work_mem = '64MB'"`, then `minipg stop app.pgdb`.
 
+minipg sizes the server's guest memory from `max_connections` and `shared_buffers` (see [Memory](#10-performance) below), reading them from `postgresql.conf`, `postgresql.auto.conf`, and the `serve` arguments, so raise them either way and restart. It doesn't follow `include` directives.
+
 minipg always starts Postgres with `listen_addresses`, `port`, and `jit=off` on the command line, so those three can't be changed with `ALTER SYSTEM`. Use `serve --listen` and `serve -p` for the first two.
 
 ## 6. Running a server explicitly
@@ -457,6 +459,10 @@ These numbers come from x86_64 Linux on h9's native backend (no KVM), compared w
 
 **Memory.** An idle server uses about 375 MB of resident memory, and about 550 MB under load, mostly shared guest memory. That's much more than native Postgres with the same settings.
 
+Each connection costs about 33 MB more. h9 copies a process's memory when it forks rather than sharing it copy-on-write, so every backend holds its own copy of the postmaster, mostly the Postgres executable and its libraries. minipg sizes the server's guest memory to fit every process the settings allow: 384 MB, plus `shared_buffers` and a little more for shared memory, plus 40 MB for each of `max_connections`, `autovacuum_max_workers`, and `max_worker_processes`, rounded up to 256 MB and never under 2 GB. With Postgres's defaults (100 connections, 128 MB of shared_buffers) that's 5 GB. Guest memory is only used as processes touch it, except on Windows (see [Files outside the .pgdb](#134-files-outside-the-pgdb)), so the figure is a ceiling, not what the server takes. The server log's first lines give it: `machine memory 5120 MB for max_connections 100 and shared_buffers 128 MB`.
+
+h9 allows at most 32 GB, about 790 connections with the defaults. Past that the server warns at start, and connections beyond what fits fail with `could not fork new process for connection: Out of memory` rather than Postgres's `too many clients`.
+
 KVM (on Linux) and Hypervisor.framework (on macOS) avoid the native backend's main cost, a cross-thread round trip on every system call, and are expected to be faster. They haven't been measured yet.
 
 ## 11. Durability and safety
@@ -494,6 +500,8 @@ KVM (on Linux) and Hypervisor.framework (on macOS) avoid the native backend's ma
 **A warning that the .pgdb was created on another architecture.** See [Moving between machines](#moving-between-machines).
 
 **A warning about a collation version.** Run the `REINDEX DATABASE` and `ALTER DATABASE ... REFRESH COLLATION VERSION` statements the warning names, in the database it names.
+
+**"could not fork new process for connection: Out of memory".** The server's guest memory ran out before `max_connections` did. minipg sizes it from `max_connections` and `shared_buffers` (see [Memory](#10-performance)), up to h9's 32 GB, and warns at start when the settings need more. Lower `max_connections` or `shared_buffers`, or use a connection pool. Settings that only an `include` file sets aren't seen; set them in `postgresql.conf`, with `ALTER SYSTEM`, or with `serve -- -c`.
 
 **"password authentication failed".** The app has an old password, likely from before a `passwd`. Get a fresh URL with `minipg url`.
 
@@ -649,7 +657,7 @@ The `.pgdb` holds only data and settings. Runtime state, logs, and unpacked root
 
 `<key>` is a hash of the `.pgdb` directory's device and inode (on Windows, its volume serial number and file index), so it follows the directory, not its name. On Linux, the runtime directory falls back to `~/.cache/minipg/run/` when `XDG_RUNTIME_DIR` isn't set, and `XDG_STATE_HOME` and `XDG_CACHE_HOME` replace `~/.local/state` and `~/.cache`. Runtime directories are mode 0700; on Windows, `%LOCALAPPDATA%` is already private to your account.
 
-On Windows, which lets only administrators (or Developer Mode) make symlinks, the root's symlinks unpack as hard links to their targets, and its few directory links as copies. On Windows, each server also commits its whole 2 GB of guest memory up front (1 GB for each running tool), so an 8 GB machine runs three or four servers at once.
+On Windows, which lets only administrators (or Developer Mode) make symlinks, the root's symlinks unpack as hard links to their targets, and its few directory links as copies. On Windows, each server also commits its whole guest memory up front (5 GB with Postgres's defaults, see [Memory](#10-performance); 1 GB for each running tool), so it counts against the page file even while idle. Lower `max_connections` to run more servers at once: with 20, a server commits 2 GB.
 
 Everything here can be deleted while no server runs. Roots unpack again and logs start over.
 

@@ -16,6 +16,7 @@ const paths = @import("paths.zig");
 const control = @import("control.zig");
 const host = @import("host.zig");
 const logwin = @import("logwin.zig");
+const pgconf = @import("pgconf.zig");
 const pgwire = @import("pgwire.zig");
 const roots = @import("roots.zig");
 const vm = @import("vm.zig");
@@ -253,9 +254,23 @@ pub fn serve(ctx: Ctx, p: Pgdb, opts: Options) !u8 {
         log.note("starting Postgres {s} for {s} on {s}/.s.PGSQL.{d}", .{ root.meta.version, p.path, runtime, port })
     else
         log.note("starting Postgres {s} for {s} on {s}:{d}", .{ root.meta.version, p.path, opts.listen, port });
+    // Room for every connection the settings allow: h9 copies each
+    // backend's memory at fork (pgconf.zig).
+    const settings = pgconf.read(arena, io, try p.sub(arena, "pgdata"), opts.postgres_args);
+    const memory = settings.memory();
+    if (!native) {
+        log.note("machine memory {d} MB for max_connections {d} and shared_buffers {d} MB", .{ memory >> 20, settings.max_connections, settings.shared_buffers >> 20 });
+        if (settings.need() > memory) {
+            const msg = "max_connections {d} needs more than minipg's {d} GB limit on machine memory; about {d} connections fit with these settings, and more fail with \"could not fork new process for connection: Out of memory\"";
+            const args = .{ settings.max_connections, pgconf.max_memory >> 30, settings.maxFittingConnections() };
+            log.note(msg, args);
+            if (!opts.foreground) ctx.warn(msg, args);
+        }
+    }
     const result = vm.runServer(ctx.gpa, io, arena, .{
         .root = root,
         .pgdb = p.path,
+        .memory = memory,
         .env = env,
         .prog = "/bin/bash",
         .argv = argv.items,

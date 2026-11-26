@@ -26,7 +26,8 @@ pub fn guestPgdata(arena: std.mem.Allocator, pgdb: []const u8) ![]const u8 {
     return std.fmt.allocPrint(arena, "{s}/pgdata", .{try guestPgdb(arena, pgdb)});
 }
 
-/// Guest memory for the server machine (the POC's figure).
+/// Guest memory for the server machine when the caller doesn't size it
+/// (pgconf.zig sizes Postgres's from its settings).
 pub const server_memory: u64 = 2 << 30;
 /// Guest memory for a tool machine.
 pub const tool_memory: u64 = 1 << 30;
@@ -82,6 +83,8 @@ pub const ServerRun = struct {
     /// Receives Postgres's stdout and stderr.
     log: *std.Io.Writer,
     signals: *h9.Machine.Signals,
+    /// Guest memory for the machine.
+    memory: u64 = server_memory,
     /// The machine's console input, if any.
     in: ?*std.Io.Reader = null,
     in_cancel: ?h9.consin.Cancel = null,
@@ -112,7 +115,7 @@ fn runServerMachine(gpa: std.mem.Allocator, io: std.Io, arena: std.mem.Allocator
             // Postgres listens on the host's own ports.
             .net = .enable,
             .cwd_writable = true,
-            .memory = server_memory,
+            .memory = r.memory,
         },
         .signals = r.signals,
         .stdio = .{ .out = r.log, .err = r.log, .in = r.in, .in_cancel = r.in_cancel },
