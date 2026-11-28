@@ -684,16 +684,38 @@ func TestStressIdleStubDeath(t *testing.T) {
 		t.Fatalf("want one new stub for the holder's backend, got %v", fresh)
 	}
 	hostKill(t, fresh[0])
-	// Within a minute, someone else can take the lock.
-	other := e.connect(url)
-	defer other.Close(ctx)
-	other.Exec(ctx, "set lock_timeout = '60s'")
+	// Within a minute, someone else can take the lock. A backend killed by
+	// SIGKILL sends Postgres through crash recovery, which resets every
+	// connection, so connect and update again until it takes or the
+	// minute is up.
 	start := time.Now()
-	if _, err := other.Exec(ctx, "update r set v = v + 1 where id = 1"); err != nil {
-		t.Errorf("the dead backend's row lock is still held %v after its h9 stub was killed: %v", time.Since(start).Round(time.Second), err)
-	} else {
-		t.Logf("lock freed %v after the kill", time.Since(start).Round(time.Millisecond))
+	var err error
+	for time.Since(start) < time.Minute {
+		err = takeLock(url)
+		if err == nil {
+			t.Logf("lock freed %v after the kill", time.Since(start).Round(time.Millisecond))
+			return
+		}
+		time.Sleep(250 * time.Millisecond)
 	}
+	t.Errorf("the dead backend's row lock is still held %v after its h9 stub was killed: %v", time.Since(start).Round(time.Second), err)
+}
+
+// takeLock connects and updates the row TestStressIdleStubDeath's holder
+// locked, waiting up to a minute for the lock.
+func takeLock(url string) error {
+	ctx, cancel := context.WithTimeout(context.Background(), 70*time.Second)
+	defer cancel()
+	c, err := pgx.Connect(ctx, url)
+	if err != nil {
+		return err
+	}
+	defer c.Close(ctx)
+	if _, err := c.Exec(ctx, "set lock_timeout = '60s'"); err != nil {
+		return err
+	}
+	_, err = c.Exec(ctx, "update r set v = v + 1 where id = 1")
+	return err
 }
 
 // TestStressCrashDuringBulkLoad kills the server group in the middle of
