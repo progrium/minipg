@@ -73,8 +73,20 @@ clean:
 .PHONY: clean
 
 ## Build distribution zips (dist/minipg_VERSION_OS_ARCH.zip)
-dist: $(foreach t,$(DIST_TARGETS),$(DIST_DIR)/$(NAME)_$(VERSION)_$(t).zip)
+dist: check-submodules $(foreach t,$(DIST_TARGETS),$(DIST_DIR)/$(NAME)_$(VERSION)_$(t).zip)
 .PHONY: dist
+
+# A release builds deps/hyper9 as it's checked out, so a checkout that isn't
+# the commit this tree pins ships a different h9 than CI tested. v0.3's
+# Windows zip was built that way, without hyper9's owner-only file modes,
+# and initdb failed on every Windows host (#15).
+check-submodules:
+	@bad=$$(git submodule status --recursive | grep -v '^ '); \
+	if [ -n "$$bad" ]; then \
+		echo "submodules don't match this commit (git submodule update --init --recursive):" >&2; \
+		echo "$$bad" >&2; exit 1; \
+	fi
+.PHONY: check-submodules
 
 $(DIST_DIR)/$(NAME)_$(VERSION)_%.zip:
 	mkdir -p $(DIST_DIR)/$*
