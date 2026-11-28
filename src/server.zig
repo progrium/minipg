@@ -324,7 +324,7 @@ fn socketOwner(dir: []const u8) void {
     if (!native or std.c.geteuid() != 0) return;
     const pw = std.c.getpwnam("postgres") orelse return;
     var buf: [std.fs.max_path_bytes]u8 = undefined;
-    const z = std.fmt.bufPrintZ(&buf, "{s}", .{dir}) catch return;
+    const z = std.fmt.bufPrintSentinel(&buf, "{s}", .{dir}, 0) catch return;
     _ = std.c.fchownat(std.c.AT.FDCWD, z, pw.uid, pw.gid, 0);
 }
 

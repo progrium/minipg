@@ -117,7 +117,7 @@ minipg run test.pgdb -- go test ./...
 
 ## Building
 
-Requires [Zig 0.16](https://ziglang.org/download/), and for the root `curl`, `jq`, `tar`, and `xz`. hyper9 is a git submodule, since it can't be fetched as a Zig package yet:
+Requires [Zig 0.17.1](https://ziglang.org/download/), and for the root `curl`, `jq`, `tar`, and `xz`. hyper9 is a git submodule, since it can't be fetched as a Zig package yet:
 
 ```sh
 git submodule update --init

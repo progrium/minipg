@@ -2,7 +2,7 @@
     .name = .minipg,
     .version = "0.4.0",
     .fingerprint = 0xf19c55893363b708,
-    .minimum_zig_version = "0.16.0",
+    .minimum_zig_version = "0.17.1",
     .dependencies = .{
         // hyper9 as a git submodule: its build.zig.zon leaves drawterm's
         // vendored sources out of the package, so it can't be fetched by

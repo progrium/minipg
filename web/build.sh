@@ -28,7 +28,7 @@ mkdir -p "$work/tpl"
 # 1 MB WAL segments rather than 16: the demo's clusters are small, and
 # every byte of the template is downloaded.
 "$NODE" --disable-warning=ExperimentalWarning "$H9/zig-out/web/h9-node" --arch 386 \
-	--root "$work/full" --writable "$work/tpl" --cwd "$work/tpl" --memory 1G \
+	--dir "$work/full:#L" --writable "$work/tpl" --cwd "$work/tpl" --memory 1G \
 	--env HOME=/root --env PATH=/usr/local/bin:/usr/bin:/bin \
 	--env POSTGRES_DB=postgres --env POSTGRES_PASSWORD=template --env POSTGRES_INITDB_ARGS=--wal-segsize=1 \
 	-- /usr/local/bin/minipg init /mnt/term/cwd/t.pgdb
@@ -45,7 +45,7 @@ cp web/profile.sh "$work/root/etc/profile.d/minipg.sh"
 zig run -OReleaseSafe "$H9/tools/webroot.zig" -- "$work/root" "$work/list" "$work/minipg.h9a"
 gzip -9 -c "$work/minipg.h9a" >"$OUT/minipg.h9a.gz"
 
-for f in h9-web.js worker.js wasi-mem.js h9.wasm v86.wasm LICENSE.v86; do
+for f in h9-web.js worker.js wasi-mem.js statictree.js h9.wasm; do
 	cp "$H9/zig-out/web/$f" "$OUT/$f"
 done
 cp web/index.html "$OUT/index.html"

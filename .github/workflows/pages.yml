@@ -29,7 +29,7 @@ jobs:
           submodules: recursive
       - uses: mlugg/setup-zig@v2
         with:
-          version: 0.16.0
+          version: 0.17.1
       - uses: actions/setup-node@v4
         with:
           node-version: 24
@@ -39,12 +39,8 @@ jobs:
         with:
           path: assets
           key: root-386-${{ hashFiles('scripts/root.sh', 'Makefile') }}
-      # h9's web host needs v86.wasm, which changes only with its pins.
-      - uses: actions/cache@v4
-        with:
-          path: deps/hyper9/.local/v86
-          key: v86-${{ hashFiles('deps/hyper9/scripts/pins.sh') }}
-      - run: cd deps/hyper9 && scripts/fetch.sh v86
+      # The pinned wasm-opt, for the web host's Asyncify pass.
+      - run: cd deps/hyper9 && scripts/fetch.sh binaryen
       - run: make web
       - name: Demo in Chromium
         run: |

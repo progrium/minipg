@@ -53,11 +53,17 @@ pub const Machine = struct {
     };
 };
 
-pub const vmm = struct {
-    pub const BackendKind = enum { auto, native, process };
+pub const engine = struct {
+    pub const Choice = enum { auto, sud };
+    pub const Kind = enum {
+        sud,
+        pub fn built(_: Kind) bool {
+            return false;
+        }
+    };
 
-    pub fn whyUnavailable(kind: BackendKind) ?[]const u8 {
-        _ = kind;
+    pub fn whyUnavailable(want: Choice) ?[]const u8 {
+        _ = want;
         return null;
     }
 };

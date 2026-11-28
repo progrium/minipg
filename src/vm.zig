@@ -58,18 +58,27 @@ pub fn exitCode(status: h9.Status) u8 {
     };
 }
 
-/// The backend machines run on. h9's `auto` never picks its native
-/// backend, which isn't a security boundary against a hostile guest. minipg
-/// runs only the image's own Postgres binaries, so where there's no
-/// hypervisor it asks for native, as Linux CI runners and containers need.
-pub fn backend() h9.vmm.BackendKind {
-    if (h9.vmm.whyUnavailable(.auto) == null) return .auto;
-    if (h9.vmm.whyUnavailable(.native) == null) return .native;
+/// The engine machines run on. h9's `auto` falls back to its emulator,
+/// hcpu, where there's no hypervisor, and never picks its sud engine (the
+/// guest on the host CPU in a stub process), which isn't a security
+/// boundary against a hostile guest. minipg runs only the image's own
+/// Postgres binaries, so where there's no hypervisor it asks for sud, which
+/// runs them at native speed, as Linux CI runners and containers need.
+pub fn backend() h9.engine.Choice {
+    if (h9.engine.whyUnavailable(.auto) == null) return .auto;
+    if (h9.engine.Kind.sud.built() and h9.engine.whyUnavailable(.sud) == null) return .sud;
     return .auto;
 }
 
 fn unavailable(err: anyerror) []const u8 {
-    return h9.vmm.whyUnavailable(.auto) orelse @errorName(err);
+    return h9.engine.whyUnavailable(.auto) orelse @errorName(err);
+}
+
+/// The Postgres root as the machine's Linux tree, with no 9front root on /.
+fn linuxRoot(arena: std.mem.Allocator, dir: []const u8) ![]const h9.Mount {
+    const m = try arena.alloc(h9.Mount, 1);
+    m[0] = .{ .kind = .dir, .src = dir, .dst = "#L" };
+    return m;
 }
 
 pub const ServerRun = struct {
@@ -104,12 +113,11 @@ pub fn runServer(gpa: std.mem.Allocator, io: std.Io, arena: std.mem.Allocator, r
 
 fn runServerMachine(gpa: std.mem.Allocator, io: std.Io, arena: std.mem.Allocator, r: ServerRun) RunResult {
     const opts: h9.Machine.Options = .{
-        .backend = backend(),
-        .linux_root = sys.kernPath(arena, r.root.dir) catch r.root.dir,
+        .engine = backend(),
+        .mounts = linuxRoot(arena, sys.kernPath(arena, r.root.dir) catch r.root.dir) catch return .{ .status = null, .err_msg = "out of memory" },
         .cwd = sys.kernPath(arena, r.pgdb) catch r.pgdb,
         .env = r.env,
         .guest_tools = false,
-        .builtin = .off,
         .console_tty = false,
         .policy = .{
             // Postgres listens on the host's own ports.
@@ -172,12 +180,11 @@ fn runToolMachine(gpa: std.mem.Allocator, io: std.Io, env_map: *const std.proces
     defer path_arena.deinit();
 
     const opts: h9.Machine.Options = .{
-        .backend = backend(),
-        .linux_root = try sys.kernPath(path_arena.allocator(), r.root.dir),
+        .engine = backend(),
+        .mounts = try linuxRoot(path_arena.allocator(), try sys.kernPath(path_arena.allocator(), r.root.dir)),
         .cwd = try sys.kernPath(path_arena.allocator(), r.cwd),
         .env = env.items,
         .guest_tools = false,
-        .builtin = .off,
         .console_tty = tty,
         .policy = .{
             .net = .enable,
