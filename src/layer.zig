@@ -256,7 +256,7 @@ fn copyTree(arena: std.mem.Allocator, io: Io, dest: Io.Dir, from: []const u8, to
 
 fn setMode(arena: std.mem.Allocator, dest: Io.Dir, name: []const u8, mode: u32) void {
     if (is_windows) return;
-    const z = arena.dupeZ(u8, name) catch return;
+    const z = arena.dupeSentinel(u8, name, 0) catch return;
     _ = std.c.fchmodat(dest.handle, z, @intCast(mode), 0);
 }
 

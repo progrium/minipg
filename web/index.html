@@ -87,7 +87,8 @@ async function start(root) {
   let raw = false;
   let line = ''; // the line being typed, in cooked mode
   const m = await createMachine({
-    root,
+    // The root is a Linux tree, so it goes on #L, with nothing on /.
+    mounts: [{ archive: root, dst: '#L' }],
     memory: '1G',
     tty: true,
     terminal: { write: (b) => term.write(b), setRaw: (on) => { raw = on; } },

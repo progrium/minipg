@@ -693,7 +693,7 @@ A short tour, for the curious. The README's "How it works" section and the sourc
 
 ## Appendix B: Building from source
 
-Building needs [Zig 0.16](https://ziglang.org/download/), and `curl`, `jq`, `tar`, and `xz` to pull the root. hyper9 is a git submodule:
+Building needs [Zig 0.17.1](https://ziglang.org/download/), and `curl`, `jq`, `tar`, and `xz` to pull the root. hyper9 is a git submodule:
 
 ```sh
 git submodule update --init

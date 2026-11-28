@@ -90,7 +90,7 @@ pub fn dirs(arena: std.mem.Allocator, env: *const Environ.Map) !Dirs {
 /// `path` with symlinks resolved, or `path` itself if it can't be.
 fn realPath(arena: std.mem.Allocator, path: []const u8) ![]const u8 {
     var buf: [std.c.PATH_MAX]u8 = undefined;
-    const r = std.c.realpath(try arena.dupeZ(u8, path), &buf) orelse return path;
+    const r = std.c.realpath(try arena.dupeSentinel(u8, path, 0), &buf) orelse return path;
     return arena.dupe(u8, std.mem.sliceTo(r, 0));
 }
 
@@ -117,7 +117,7 @@ pub fn socketPath(arena: std.mem.Allocator, dir: []const u8, name: []const u8, f
 /// Makes `path` a directory only this user can use, refusing one that
 /// someone else made first or that is a symlink: /tmp is shared.
 fn makeOwnedPrivateDir(arena: std.mem.Allocator, path: []const u8) !void {
-    const z = try arena.dupeZ(u8, path);
+    const z = try arena.dupeSentinel(u8, path, 0);
     _ = std.c.mkdir(z, 0o700);
     const st = try lstatOwner(z);
     if (st.mode & std.c.S.IFMT != std.c.S.IFDIR or st.uid != std.c.getuid()) return error.AccessDenied;
@@ -140,7 +140,7 @@ fn lstatOwner(z: [:0]const u8) !struct { mode: u32, uid: u32 } {
 
 /// The key for a .pgdb directory: its device and inode, hashed.
 pub fn key(arena: std.mem.Allocator, dir: []const u8) ![]const u8 {
-    const z = try arena.dupeZ(u8, dir);
+    const z = try arena.dupeSentinel(u8, dir, 0);
     var h: std.hash.Wyhash = .init(0);
     if (sys.is_windows) {
         const id = try sys.fileId(arena, dir);
@@ -174,7 +174,7 @@ pub fn makePrivateDir(io: std.Io, arena: std.mem.Allocator, path: []const u8) !v
 /// Sets a file's mode on POSIX; a no-op on Windows, which has none.
 pub fn chmod(arena: std.mem.Allocator, path: []const u8, mode: u32) !void {
     if (sys.is_windows) return;
-    _ = std.c.chmod(try arena.dupeZ(u8, path), @intCast(mode));
+    _ = std.c.chmod(try arena.dupeSentinel(u8, path, 0), @intCast(mode));
 }
 
 /// Writes `data` to `path` through a temporary file and a rename, so
@@ -196,7 +196,7 @@ test socketPath {
     defer arena.deinit();
     const a = arena.allocator();
     try std.testing.expectEqualStrings("/run/x/control.sock", try socketPath(a, "/run/x", "control.sock", "k.sock"));
-    const long = "/" ++ "d" ** 120;
+    const long = "/" ++ @as([120]u8, @splat('d'));
     const p = try socketPath(a, long, "control.sock", "k.sock");
     try std.testing.expect(p.len <= socket_path_max);
     try std.testing.expect(std.mem.startsWith(u8, p, "/tmp/minipg-"));

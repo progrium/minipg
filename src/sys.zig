@@ -168,7 +168,7 @@ pub fn alive(id: i32) bool {
     if (std.c.kill(id, @enumFromInt(0)) != 0 and std.c._errno().* == @intFromEnum(std.c.E.SRCH)) return false;
     if (builtin.os.tag != .linux) return true;
     var path: [32:0]u8 = undefined;
-    const z = std.fmt.bufPrintZ(&path, "/proc/{d}/stat", .{id}) catch return true;
+    const z = std.fmt.bufPrintSentinel(&path, "/proc/{d}/stat", .{id}, 0) catch return true;
     const fd = std.c.open(z, .{});
     if (fd < 0) return true;
     defer _ = std.c.close(fd);

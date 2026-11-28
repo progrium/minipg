@@ -88,7 +88,7 @@ pub const Client = struct {
     pub fn get(c: *Client, arena: std.mem.Allocator, url: []const u8, headers: []const http.Header) !*Response {
         const uri = try std.Uri.parse(url);
         if (!std.mem.eql(u8, uri.scheme, "https")) return error.UnsupportedUriScheme;
-        const host = (try uri.getHostAlloc(arena)).bytes;
+        const host = (try Io.net.HostName.fromUri(uri, try arena.create([Io.net.HostName.max_len]u8))).bytes;
         const port = uri.port orelse 443;
         const r = try arena.create(Response);
         r.* = .{ .stream = undefined, .sr = undefined, .sw = undefined, .tls = undefined, .hr = undefined, .head = undefined, .body = undefined };
@@ -107,7 +107,7 @@ pub const Client = struct {
             if (p.auth) |a| try w.print("Proxy-Authorization: {s}\r\n", .{a});
             try w.writeAll("\r\n");
             try w.flush();
-            var pr: http.Reader = .{ .in = &r.sr.interface, .interface = undefined, .state = .ready, .max_head_len = 8192 };
+            var pr: http.Reader = .{ .in = &r.sr.interface, .interface = undefined, .state = .ready, .side = .response, .max_head_len = 8192 };
             const ph = http.Client.Response.Head.parse(try pr.receiveHead()) catch return error.ProxyError;
             if (ph.status != .ok) return error.ProxyRefused;
         }
@@ -133,7 +133,7 @@ pub const Client = struct {
         try w.flush();
         try r.sw.interface.flush();
 
-        r.hr = .{ .in = &r.tls.reader, .interface = undefined, .state = .ready, .max_head_len = r.tls_in.len };
+        r.hr = .{ .in = &r.tls.reader, .interface = undefined, .state = .ready, .side = .response, .max_head_len = r.tls_in.len };
         const bytes = try arena.dupe(u8, try r.hr.receiveHead());
         r.head = try http.Client.Response.Head.parse(bytes);
         r.body = r.hr.bodyReader(&r.transfer, r.head.transfer_encoding, r.head.content_length);

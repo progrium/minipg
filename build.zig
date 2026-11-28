@@ -86,6 +86,7 @@ pub fn build(b: *std.Build) void {
     }
 
     const install = b.addInstallArtifact(exe, .{});
+    const installed = b.graph.path(.install_bin, exe.out_filename);
     b.getInstallStep().dependOn(&install.step);
 
     // HVF refuses to create a VM without the hypervisor entitlement.
@@ -97,15 +98,16 @@ pub fn build(b: *std.Build) void {
         if (!std.mem.eql(u8, sign_identity, "-")) sign.addArgs(&.{ "--options", "runtime", "--timestamp" });
         sign.addArg("--entitlements");
         sign.addFileArg(b.path("h9.entitlements"));
-        sign.addArg(b.getInstallPath(.bin, exe.out_filename));
+        sign.addFileArg(installed);
         sign.step.dependOn(&install.step);
         b.getInstallStep().dependOn(&sign.step);
         ready = &sign.step;
     }
 
-    const run = b.addSystemCommand(&.{b.getInstallPath(.bin, exe.out_filename)});
+    const run = std.Build.Step.Run.create(b, "run minipg");
+    run.addFileArg(installed);
     run.step.dependOn(ready);
-    if (b.args) |args| run.addArgs(args);
+    run.addPassthruArgs();
     b.step("run", "Run minipg").dependOn(&run.step);
 
     const tests = b.addTest(.{ .root_module = b.createModule(.{

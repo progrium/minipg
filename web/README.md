@@ -2,11 +2,12 @@
 
 A page that runs minipg in the browser. It opens a busybox shell with
 `minipg` on PATH, and Postgres 18 for 386 Linux runs on h9's browser host
-(v86 in a Web Worker). It uses the Linux build (`-Dhost=linux`), where
+(h9's own 386 CPU, h86, in a Web Worker). It uses the Linux build (`-Dhost=linux`), where
 Postgres serves on its unix socket alone, because the page has no TCP.
 
 ```sh
 make root ARCH=386     # assets/root-386.tar.xz
+(cd deps/hyper9 && scripts/fetch.sh binaryen)   # wasm-opt for the web host
 make web NODE=node24   # .zig-out/web
 cd .zig-out/web && python3 -m http.server
 ```
@@ -26,7 +27,7 @@ plus h9.wasm.
   and the shell edit lines themselves.
 
 `minipg init` copies the template rather than running initdb, which
-takes about 9s instead of 31s under v86.
+is much faster than running initdb under the emulator.
 
 `.github/workflows/pages.yml` builds this on every push to main, tests
 it in Chromium with `web/test.mjs`, and publishes it under `demo/` of

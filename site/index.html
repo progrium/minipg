@@ -71,7 +71,7 @@ The demo runs minipg's Linux build, which runs inside the Postgres image itself.
 It starts Postgres as ordinary processes and serves on a unix socket,
 since a page has no TCP.
 New databases come from a template cluster made at build time,
-because initdb takes half a minute on v86.
+because initdb is slow under the emulator.
 </p>
 
 <h2 id="using">Using It</h2>
@@ -128,7 +128,7 @@ psql, pg_dump, and the other tools each run in their own short-lived h9 machine
 <tr><td>Linux x86_64</td><td>KVM, or h9's native backend without it (Linux 5.11 or later)</td></tr>
 <tr><td>Linux arm64</td><td>KVM</td></tr>
 <tr><td>macOS (Apple Silicon)</td><td>Hypervisor.framework</td></tr>
-<tr><td>The browser</td><td>h9's web host, v86, and minipg's Linux build</td></tr>
+<tr><td>The browser</td><td>h9's web host, its 386 emulator, and minipg's Linux build</td></tr>
 </table>
 
 <h2 id="code">Source Code</h2>
@@ -167,7 +167,6 @@ Please report bugs and send questions through
 <li><a href="https://progrium.github.io/hyper9/">h9</a>, which runs native 9front executables, and Linux ones, on host hypervisors</li>
 <li><a href="https://www.postgresql.org/">PostgreSQL</a> and Docker Hub's
   <a href="https://hub.docker.com/_/postgres">postgres</a> image</li>
-<li><a href="https://github.com/copy/v86">v86</a>, the x86 emulator the demo runs on</li>
 <li><a href="https://xtermjs.org/">xterm.js</a>, the demo's terminal</li>
 </ul>
 
